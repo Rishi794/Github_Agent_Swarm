@@ -109,7 +109,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           echo "Task prompt source: $SOURCE"
-          echo "Task prompt ($(wc -c < /tmp/task_prompt.txt) bytes, $(wc -l < /tmp/task_prompt.txt) lines):"
+          PROMPT_BYTES=$(wc -c < /tmp/task_prompt.txt)
+          EST_TOKENS=$((PROMPT_BYTES / 4))
+          CTX=$(python3 -c 'import json;print(json.load(open("external_config/model_config.json"))["llama_server_flags"]["ctx_size"])')
+          echo "Task prompt: ${PROMPT_BYTES} bytes, ~${EST_TOKENS} tokens (model ctx_size=${CTX})"
+          if [ "$EST_TOKENS" -gt "$((CTX / 2))" ]; then
+            echo "::warning::system_prompt.md is ~${EST_TOKENS} tokens but ctx_size is ${CTX}; RAG context, peer findings and tool results may overflow the window. Raise ctx_size in Model_Config or shorten the prompt."
+          fi
           sed -n '1,8p' /tmp/task_prompt.txt
 
       - name: Configure 4GB Swap & Reclaim Disk Space (OOM Guard)
