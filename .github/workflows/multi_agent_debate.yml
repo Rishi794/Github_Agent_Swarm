@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       task_prompt:
-        description: 'Problem statement for the multi-agent debate swarm'
-        required: true
-        default: 'Architect a Byzantine-fault-tolerant distributed rate limiter across multi-region edge nodes.'
+        description: 'Problem statement; leave EMPTY to use the task defined in system_prompt.md'
+        required: false
+        default: ''
       config_repo:
         description: 'External GitHub repository containing model_config.json (owner/repo)'
         required: true
@@ -31,6 +31,11 @@ on:
         description: 'Optional: override debate_rounds (leave empty to use model_config.json)'
         required: false
         default: ''
+  schedule:
+    # Every 3 hours (UTC, on the hour). The mission comes from system_prompt.md.
+    # Runs are serialized by the `swarm-debate` concurrency group below, so a slow
+    # debate can never overlap the next scheduled one mid-round.
+    - cron: '0 */3 * * *'
 
 permissions:
   contents: write
@@ -61,10 +66,51 @@ jobs:
       - name: Checkout External Model Configuration Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.config_repo }}
-          ref: ${{ inputs.config_ref }}
+          # `||` fallbacks matter: on a `schedule` event GitHub does NOT apply
+          # workflow_dispatch input defaults, so inputs.* would be empty strings.
+          repository: ${{ inputs.config_repo || 'Rishi794/Model_Config' }}
+          ref: ${{ inputs.config_ref || 'main' }}
           path: external_config
           token: ${{ secrets.CONFIG_REPO_TOKEN || github.token }}
+
+      - name: Resolve Task Prompt (dispatch input > system_prompt.md)
+        id: task_prompt
+        env:
+          INPUT_TASK_PROMPT: ${{ inputs.task_prompt }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TASK_PROMPT//[[:space:]]/}" ]; then
+            SOURCE="workflow_dispatch input"
+            printf '%s\n' "$INPUT_TASK_PROMPT" > /tmp/task_prompt.txt
+          elif [ -f system_prompt.md ]; then
+            SOURCE="system_prompt.md"
+            # Strip HTML comments so author notes never reach the model.
+            python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("system_prompt.md").read_text(encoding="utf-8")
+          text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+          text = re.sub(r"\n{3,}", "\n\n", text).strip()
+          pathlib.Path("/tmp/task_prompt.txt").write_text(text + "\n", encoding="utf-8")
+          PY
+          else
+            echo "::error::No task prompt: fill system_prompt.md or set the task_prompt input."
+            exit 1
+          fi
+
+          if [ ! -s /tmp/task_prompt.txt ] || [ -z "$(tr -d '[:space:]' < /tmp/task_prompt.txt)" ]; then
+            echo "::error::Resolved task prompt (from $SOURCE) is empty."
+            exit 1
+          fi
+
+          {
+            echo "prompt<<__TASK_PROMPT_EOF__"
+            cat /tmp/task_prompt.txt
+            echo "__TASK_PROMPT_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Task prompt source: $SOURCE"
+          echo "Task prompt ($(wc -c < /tmp/task_prompt.txt) bytes, $(wc -l < /tmp/task_prompt.txt) lines):"
+          sed -n '1,8p' /tmp/task_prompt.txt
 
       - name: Configure 4GB Swap & Reclaim Disk Space (OOM Guard)
         run: |
@@ -138,7 +184,7 @@ jobs:
 
       - name: Run Pre-LLM Vector RAG Search (Isolated Process to Save RAM)
         env:
-          TASK_PROMPT: ${{ inputs.task_prompt }}
+          TASK_PROMPT: ${{ steps.task_prompt.outputs.prompt }}
           CONFIG_PATH: external_config/model_config.json
           KB_DB_PATH: central_memory/knowledge_base.db
           RAG_CONTEXT_PATH: /tmp/rag_context.json
@@ -235,7 +281,7 @@ jobs:
       - name: Boot CPU-Optimized llama-server & Execute Multi-Round Debate
         env:
           AGENT_ID: ${{ matrix.agent_id }}
-          TASK_PROMPT: ${{ inputs.task_prompt }}
+          TASK_PROMPT: ${{ steps.task_prompt.outputs.prompt }}
           ALL_AGENTS: "researcher,security_auditor,synthesizer"
           ROUNDS_OVERRIDE: ${{ inputs.rounds_override }}
           CONFIG_PATH: external_config/model_config.json
@@ -325,8 +371,10 @@ jobs:
       - name: Checkout External Model Configuration Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.config_repo }}
-          ref: ${{ inputs.config_ref }}
+          # `||` fallbacks matter: on a `schedule` event GitHub does NOT apply
+          # workflow_dispatch input defaults, so inputs.* would be empty strings.
+          repository: ${{ inputs.config_repo || 'Rishi794/Model_Config' }}
+          ref: ${{ inputs.config_ref || 'main' }}
           path: external_config
           token: ${{ secrets.CONFIG_REPO_TOKEN || github.token }}
 

@@ -94,20 +94,58 @@ https://raw.githubusercontent.com/Rishi794/Github_Agent_Swarm/central-storage/ag
 Same branch topology, one inference per agent against a locally served Ollama
 model, results merged into `knowledge_base.json` + `SWARM_REPORT.md` on
 `central-storage`. Useful for quick runs; the debate workflow is the one that
-produces cross-critiqued, vector-indexed knowledge.
+produces cross-critiqued, vector-indexed knowledge. It is **manual-only** on
+purpose — scheduling both would race two writers onto `central-storage` and
+double the compute bill for the same mission.
+
+### `keepalive.yml` — repo/Actions liveness guard
+
+Weekly heartbeat commit + automatic re-enable of any workflow GitHub disabled for
+inactivity. See ["Repo & Actions stay alive"](#repo--actions-stay-alive-automatically).
 
 ---
 
 ## 3. Running it
 
-1. Edit `model_config.json` in `Rishi794/Model_Config` if you want a different model or tune flags.
-2. **Actions → Multi-Agent Debate Swarm (llama.cpp + sqlite-vec) → Run workflow**
-   - `task_prompt` — the problem statement.
-   - `config_repo` — defaults to `Rishi794/Model_Config`.
-   - `config_ref` — branch/tag of the config repo (defaults to `main`).
-   - `rounds_override` — optional; overrides `debate_rounds` for a single run.
-3. Watch `agent-state/*` branches fill up round by round, then inspect
-   `central-storage` for the database and the Markdown transcript.
+The swarm runs **automatically every 3 hours** (`cron: '0 */3 * * *'`, UTC) using the
+mission defined in [`system_prompt.md`](./system_prompt.md) at the repo root.
+
+### Changing the mission — no code changes
+
+1. Edit `system_prompt.md`. Anything inside `<!-- HTML comments -->` is stripped
+   before the agents see it, so you can keep author notes in the same file.
+2. Commit to `main`.
+3. The next scheduled run picks it up.
+
+### Triggering a run manually
+
+**Actions → Multi-Agent Debate Swarm (llama.cpp + sqlite-vec) → Run workflow**
+
+- `task_prompt` — leave **empty** to use `system_prompt.md`, or type a one-off mission.
+- `config_repo` — defaults to `Rishi794/Model_Config`.
+- `config_ref` — branch/tag of the config repo (defaults to `main`).
+- `rounds_override` — optional; overrides `debate_rounds` for a single run.
+
+Each run fills `agent-state/<agent>` round by round, then a single consolidator job
+publishes `knowledge_base.db`, `agentic_results.md` and `README.md` to `central-storage`.
+
+### Schedule behaviour (know this before you tune it)
+
+- Cron is **UTC** and always runs the **default branch** (`main`).
+- Runs are serialized by `concurrency: swarm-debate` (`cancel-in-progress: false`).
+  GitHub keeps one running + one pending per group, so extra triggers **coalesce**
+  instead of piling up — a 90-minute debate can never be clobbered by the next cron tick.
+- GitHub may delay scheduled runs by a few minutes under peak load.
+- **To pause:** comment out the `schedule:` block in `.github/workflows/multi_agent_debate.yml`
+  or disable the workflow in the Actions UI. Manual dispatch keeps working either way.
+
+### Repo & Actions stay alive automatically
+
+| Concern | Reality | What this repo does |
+| --- | --- | --- |
+| GitHub disables scheduled workflows after 60 days of repo inactivity | Real, automatic | Every debate run pushes to `agent-state/*` + `central-storage` (activity); `keepalive.yml` also commits a weekly heartbeat and re-enables any workflow GitHub disabled |
+| A repo silently gets archived | **Not a GitHub behaviour** — archiving is a manual owner action | Nothing needed; the repo cannot archive itself |
+| Actions turned off for billing | Happens when paid minutes run out | This repo is **public**, so standard-runner minutes are free |
 
 ### Secrets
 

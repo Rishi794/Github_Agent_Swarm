@@ -14,10 +14,13 @@ name: Multi-Agent Swarm (Ollama, single-pass)
 on:
   workflow_dispatch:
     inputs:
+      # NOTE: manual-only on purpose. `schedule` events do NOT receive workflow_dispatch
+      # input defaults, so a cron trigger here would need `||` fallbacks on every input.
+      # The debate workflow is the scheduled one.
       task_prompt:
-        description: 'Task or research question for the multi-agent swarm'
-        required: true
-        default: 'Design a zero-downtime database migration strategy for a high-throughput payment ledger.'
+        description: 'Task or research question; leave EMPTY to use the task defined in system_prompt.md'
+        required: false
+        default: ''
       pareto_model:
         description: 'Model tag (qwen3:8b / qwen3:14b for standard runners, qwen3.5:35b-a3b for 32GB+ runners)'
         required: true
@@ -47,6 +50,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Resolve Task Prompt (dispatch input > system_prompt.md)
+        id: task_prompt
+        env:
+          INPUT_TASK_PROMPT: ${{ inputs.task_prompt }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TASK_PROMPT//[[:space:]]/}" ]; then
+            SOURCE="workflow_dispatch input"
+            printf '%s\n' "$INPUT_TASK_PROMPT" > /tmp/task_prompt.txt
+          elif [ -f system_prompt.md ]; then
+            SOURCE="system_prompt.md"
+            # Strip HTML comments so author notes never reach the model.
+            python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("system_prompt.md").read_text(encoding="utf-8")
+          text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+          text = re.sub(r"\n{3,}", "\n\n", text).strip()
+          pathlib.Path("/tmp/task_prompt.txt").write_text(text + "\n", encoding="utf-8")
+          PY
+          else
+            echo "::error::No task prompt: fill system_prompt.md or set the task_prompt input."
+            exit 1
+          fi
+
+          if [ ! -s /tmp/task_prompt.txt ] || [ -z "$(tr -d '[:space:]' < /tmp/task_prompt.txt)" ]; then
+            echo "::error::Resolved task prompt (from $SOURCE) is empty."
+            exit 1
+          fi
+
+          {
+            echo "prompt<<__TASK_PROMPT_EOF__"
+            cat /tmp/task_prompt.txt
+            echo "__TASK_PROMPT_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Task prompt source: $SOURCE"
+          echo "Task prompt ($(wc -c < /tmp/task_prompt.txt) bytes, $(wc -l < /tmp/task_prompt.txt) lines):"
+          sed -n '1,8p' /tmp/task_prompt.txt
 
       - name: Fetch Existing Centralized Storage (Read-Only Context)
         continue-on-error: true
@@ -107,7 +149,7 @@ jobs:
       - name: Execute Agent Reasoning Loop
         env:
           AGENT_ID: ${{ matrix.agent_id }}
-          TASK_PROMPT: ${{ inputs.task_prompt }}
+          TASK_PROMPT: ${{ steps.task_prompt.outputs.prompt }}
           MODEL_NAME: ${{ inputs.pareto_model }}
           SYSTEM_PROMPTS_PATH: agents/system_prompts.json
           CENTRAL_MEMORY_PATH: central_memory/knowledge_base.json
