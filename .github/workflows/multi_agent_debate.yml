@@ -2,7 +2,7 @@ name: Multi-Agent Debate Swarm (llama.cpp + sqlite-vec)
 
 # Fan-out / fan-in topology
 #   main              -> orchestration (this file + agents/*.py)
-#   agent-state/<id>  -> per-agent, collision-free debate transcript per round
+#   agent-state/<id>  -> per-agent debate transcript per round (output-only orphan branch)
 #   central-storage   -> orphan branch holding knowledge_base.db (sqlite-vec) + dashboard
 #
 # Model configuration is read at runtime from a SEPARATE repository (see `config_repo`),
@@ -32,10 +32,12 @@ on:
         required: false
         default: ''
   schedule:
-    # Every 3 hours (UTC, on the hour). The mission comes from system_prompt.md.
-    # Runs are serialized by the `swarm-debate` concurrency group below, so a slow
-    # debate can never overlap the next scheduled one mid-round.
-    - cron: '0 */3 * * *'
+    # Every 6 hours (UTC, on the hour). The mission comes from system_prompt.md.
+    # A full 100-agent run takes ~2-3 h, so the 6 h cadence leaves the runner
+    # queue room to drain; runs are additionally serialized by the
+    # `swarm-debate` concurrency group below, so a slow debate can never
+    # overlap the next scheduled one mid-round.
+    - cron: '0 */6 * * *'
 
 permissions:
   contents: write

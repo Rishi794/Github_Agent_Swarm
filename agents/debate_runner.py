@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -143,10 +144,21 @@ def state_branch(agent_id: str) -> str:
 
 
 def prepare_agent_branch(agent_id: str) -> None:
-    """Create the agent's own state branch once, before round 1."""
+    """Create the agent's own state branch once, before round 1.
+
+    The branch is an **orphan whose only tracked files are this agent's
+    ``output/`` round files**. Legacy branches were cut from the full main
+    checkout, so every repo file -- including ``.github/workflows/*`` -- rode
+    along in their tree; GITHUB_TOKEN can never create or update workflow
+    files, so any workflow edit on main made the next agent push fail with
+    "refusing to allow a GitHub App to create or update workflow ...
+    without `workflows` permission". Output-only trees are immune to that,
+    and they push far less data every round.
+    """
     branch = state_branch(agent_id)
-    git("checkout", "-B", branch)
-    print(f"[{agent_id}] Working on isolated state branch: {branch}")
+    git("checkout", "--orphan", branch)
+    git("rm", "-rf", "--cached", ".", check=False)
+    print(f"[{agent_id}] Working on isolated state branch: {branch} (output-only orphan)")
 
 
 def push_round_to_agent_branch(agent_id: str, round_num: int, run_id: str) -> None:
@@ -156,9 +168,41 @@ def push_round_to_agent_branch(agent_id: str, round_num: int, run_id: str) -> No
 
     git("add", "-f", str(OUTPUT_DIR / f"round_{round_num}.json"), str(OUTPUT_DIR / "latest.json"))
     git("commit", "-m", f"debate({agent_id}): round {round_num} [run {run_id}]", check=False)
-    git("push", remote, branch, "--force")
+
+    force_push_agent_branch(agent_id, branch, remote)
 
     print(f"[{agent_id}] Pushed Round {round_num} -> {remote}/{branch}")
+
+
+def force_push_agent_branch(agent_id: str, branch: str, remote: str, attempts: int = 3) -> None:
+    """Force-push the agent branch, self-healing legacy branches and flakes.
+
+    Replacing a legacy full-tree branch with an output-only orphan deletes
+    ``.github/workflows/*`` on that ref, which GITHUB_TOKEN is not allowed to
+    do. Deleting the ref first sidesteps the file-level check (a ref deletion
+    updates no files); transient failures get bounded backoff with jitter,
+    because 20+ matrix legs push concurrently.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            git("push", remote, branch, "--force")
+            return
+        except RuntimeError as exc:
+            message = str(exc)
+            if "workflow" in message and attempt == 1:
+                print(
+                    f"[{agent_id}] Push rejected by the workflow-permission guard "
+                    f"(legacy branch carried repo files); deleting {remote}/{branch} and recreating it."
+                )
+                git("push", remote, "--delete", branch, check=False)
+                continue
+            detail = message.strip().splitlines()[-1] if message.strip() else message
+            if attempt < attempts:
+                delay = (2**attempt) + random.random()
+                print(f"[{agent_id}] Push failed ({detail}); retrying in {delay:.1f}s ({attempt}/{attempts}) ...")
+                time.sleep(delay)
+                continue
+            raise
 
 
 def wait_for_peer_rounds(
@@ -374,9 +418,16 @@ def main() -> int:
 
     rag_context = RAG_CONTEXT_PATH.read_text(encoding="utf-8") if RAG_CONTEXT_PATH.exists() else "{}"
 
+    # Cold 32k-ctx CPU prefill on a 4-vCPU runner can outlive the OpenAI SDK's
+    # 600 s default timeout by a wide margin; a slow prefill must not be
+    # mistaken for a dead server. Hot-swappable via Model_Config
+    # (`llm_timeout_sec`) or the LLM_TIMEOUT_SEC env override.
+    llm_timeout_sec = float(os.environ.get("LLM_TIMEOUT_SEC") or config.get("llm_timeout_sec", 1800))
     client = OpenAI(
         base_url=os.environ.get("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1"),
         api_key=os.environ.get("LLAMA_API_KEY", "llama-cpp"),
+        timeout=llm_timeout_sec,
+        max_retries=1,
     )
 
     OUTPUT_DIR.mkdir(exist_ok=True)

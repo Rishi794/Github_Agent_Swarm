@@ -186,6 +186,10 @@ def main() -> int:
     client = OpenAI(
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
         api_key=os.environ.get("OLLAMA_API_KEY", "ollama"),
+        # CPU prefill of a 32k-ctx prompt routinely outlives the SDK default;
+        # a slow round must degrade gracefully, not kill the matrix leg.
+        timeout=float(os.environ.get("LLM_TIMEOUT_SEC", "1800")),
+        max_retries=1,
     )
 
     print(f"[{agent_id}] Running inference with Pareto model: {model_name} (tools={tools_enabled}) ...")

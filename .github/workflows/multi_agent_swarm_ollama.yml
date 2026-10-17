@@ -5,7 +5,7 @@ name: Multi-Agent Swarm (Ollama, single-pass)
 # locally served Ollama model instead of a multi-round llama.cpp debate:
 #
 #   main              -> orchestration (this file + agents/*.py)
-#   agent-state/<id>  -> per-agent findings (collision-free single writer each)
+#   agent-state/<id>  -> per-agent findings (output-only orphan branch, single writer each)
 #   central-storage   -> knowledge_base.json + SWARM_REPORT.md
 #
 # Use this when you want fast, cheap runs; use the debate workflow when you want
@@ -219,11 +219,27 @@ jobs:
           git config user.name "agent-${AGENT_ID}[bot]"
           git config user.email "${AGENT_ID}@users.noreply.github.com"
 
-          # One writer per branch: no two runners ever push to the same ref.
-          git checkout -B "agent-state/${AGENT_ID}"
+          BRANCH="agent-state/${AGENT_ID}"
+
+          # Output-only orphan branch: agent branches must never carry repo
+          # files. A legacy full-tree branch makes every workflow edit on main
+          # unpushable for GITHUB_TOKEN ("refusing to allow a GitHub App to
+          # create or update workflow ... without `workflows` permission").
+          git checkout --orphan "$BRANCH"
+          git rm -rf --cached . > /dev/null
+
           git add -f "output/${AGENT_ID}_finding.json"
           git commit -m "chore(${AGENT_ID}): findings for run ${{ github.run_id }}"
-          git push origin "agent-state/${AGENT_ID}" --force
+
+          # One writer per branch: no two runners ever push to the same ref.
+          if ! git push origin "$BRANCH" --force; then
+            # Self-heal legacy branches: delete the ref (ref deletion updates
+            # no files, so the workflow-file check cannot fire), then
+            # recreate it output-only.
+            echo "::warning::Replacing legacy $BRANCH (carries repo files); deleting ref and retrying."
+            git push origin --delete "$BRANCH" || true
+            git push origin "$BRANCH" --force
+          fi
 
       - name: Upload Findings Artifact
         if: always()

@@ -9,7 +9,7 @@ Two repositories, deliberately separated:
 
 | Repository | Role | Contents |
 | --- | --- | --- |
-| **`Rishi794/Model_Config`** (this is the *control plane*) | Model configuration | `model_config.json` — model, quantization, `llama-server` CPU flags, debate rounds, RAG depth |
+| **`Rishi794/Model_Config`** (this is the *control plane*) | Model configuration | `model_config.json` — model, quantization, `llama-server` CPU flags, debate rounds, RAG depth, LLM client timeout |
 | **`Rishi794/Github_Agent_Swarm`** (this repo, *execution plane*) | Code + state | Workflows, agents, and the Git branches that carry agent state |
 
 Because the model config lives outside the code, you can swap a model, quant, or
@@ -136,8 +136,9 @@ inactivity. See ["Repo & Actions stay alive"](#repo--actions-stay-alive-automati
 
 ## 3. Running it
 
-The swarm runs **automatically every 3 hours** (`cron: '0 */3 * * *'`, UTC) using the
-mission defined in [`system_prompt.md`](./system_prompt.md) at the repo root.
+The swarm runs **automatically every 6 hours** (`cron: '0 */6 * * *'`, UTC) using the
+mission defined in [`system_prompt.md`](./system_prompt.md) at the repo root. The
+cadence leaves the runner queue room to drain: a full 100-agent run takes ~2–3 h.
 
 ### Changing the mission — no code changes
 
@@ -155,8 +156,11 @@ mission defined in [`system_prompt.md`](./system_prompt.md) at the repo root.
 - `config_ref` — branch/tag of the config repo (defaults to `main`).
 - `rounds_override` — optional; overrides `debate_rounds` for a single run.
 
-Each run fills `agent-state/<agent>` round by round, then a single consolidator job
-publishes `knowledge_base.db`, `agentic_results.md` and `README.md` to `central-storage`
+Each run fills `agent-state/<agent>` round by round — an **output-only orphan
+branch** tracking nothing but that agent's `output/*.json`, so repo files (and
+therefore `.github/workflows/*`) can never ride along and trip GitHub's
+workflow-file push protection — then a single consolidator job publishes
+`knowledge_base.db`, `agentic_results.md` and `README.md` to `central-storage`
 as a force-pushed single-commit orphan snapshot (writes from the other workflows on the
 same branch are preserved).
 
@@ -174,7 +178,8 @@ synthesis prompt (1–25, default 8).
 - Cron is **UTC** and always runs the **default branch** (`main`).
 - Runs are serialized by `concurrency: swarm-debate` (`cancel-in-progress: false`).
   GitHub keeps one running + one pending per group, so extra triggers **coalesce**
-  instead of piling up — a 90-minute debate can never be clobbered by the next cron tick.
+  instead of piling up — a 2–3 hour full-roster run finishes well before the next
+  6-hour tick and no two runs can rewrite `agent-state/*` at once.
 - GitHub may delay scheduled runs by a few minutes under peak load.
 - **To pause:** comment out the `schedule:` block in `.github/workflows/multi_agent_debate.yml`
   or disable the workflow in the Actions UI. Manual dispatch keeps working either way.
@@ -359,6 +364,8 @@ ORDER BY v.distance ASC;
 | Exit code 137 | Runner RAM exhausted | Lower `ctx_size`, use a smaller quant/model, keep `-np 1`. |
 | `No ... asset found` during model download | Pinned `llama_cpp_release` has no Linux CPU build | Set `llama_cpp_release` back to `"auto"`. |
 | `Timed out ... no peer published` | Every peer in the barrier target failed or is very slow | Raise `peer_timeout_sec`; check the failing matrix legs. A *partial* timeout no longer fails — the runner logs `Peer sync incomplete ... proceeding` and continues. |
+| `refusing to allow a GitHub App to create or update workflow ... without 'workflows' permission` | An `agent-state/*` branch still carries the legacy full-repo tree while main's workflow files changed — GITHUB_TOKEN may never create or update workflow files | Self-healing: the runner deletes the offending ref once and recreates it output-only. Leftover branches heal on the next run, or via `git push origin --delete agent-state/<agent>`. |
+| `APITimeoutError` during round 1 | Cold 32k-ctx CPU prefill exceeds the OpenAI SDK's default 600 s timeout | Already raised: `llm_timeout_sec` in `model_config.json` (default 1800 s) or `LLM_TIMEOUT_SEC`; shrink `ctx_size`/RAG depth if prefill is still slower than that. |
 | `llama-server did not become healthy` | Bad flag combination in `llama_server_flags` | Inspect the printed server log tail; verify the flag exists in your pinned build. |
 | Vector search returns nothing | No `knowledge_base.db` yet, or `embedding_dim` changed | Run the debate once to populate it; keep `embedding_dim` in sync with `embedding_model`. |
 | Agents never call tools | Chat template without tool support, or tools disabled | Keep `--jinja` on the server launch (already set) and `enable_tools: true`; check the persona's `tools` list. |
