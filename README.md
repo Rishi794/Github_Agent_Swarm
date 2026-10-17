@@ -27,7 +27,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
                                         │ actions/checkout (path: external_config/)
                                         ▼
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ JOB 0  roster  (reads agents/system_prompts.json — currently 100 personas)     │
+│ JOB 0  roster  (reads agents/system_prompts.json — 100 research agents)        │
 │ JOB 1  debate-agents  (matrix = roster keys; one isolated leg per agent)      │
 │                                                                               │
 │  rag_query.py  ──►  /tmp/rag_context.json   (embeddings, then process exits)   │
@@ -59,7 +59,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 | Branch | Writer | Contents |
 | --- | --- | --- |
 | `main` | you | Workflows and Python orchestration only. Never receives automated data commits. |
-| `agent-state/<agent_id>` (one per persona; 100 today) | that persona's runner only | `output/round_<r>.json`, `output/latest.json` |
+| `agent-state/<agent_id>` (one per research agent; 100 today) | that agent's runner only | `output/round_<r>.json`, `output/latest.json` |
 | `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard — published as a **single-commit orphan snapshot** (force-pushed each run), so the mutating binary DB never accumulates in `.git` packfiles. Files published by other writers (Ollama store, `search_results.md`) are carried over. |
 
 One writer per ref means parallel runners can never produce `non-fast-forward`
@@ -229,7 +229,7 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 │   ├── multi_agent_swarm_ollama.yml   # single-pass Ollama swarm            (alternative)
 │   └── swarm_search.yml               # ask the knowledge base (issue or manual)
 ├── agents/
-│   ├── system_prompts.json            # personas + per-persona tool allowlists
+│   ├── system_prompts.json            # the 100 research agents (mandate + tools)
 │   ├── agent_tools.py                 # search_web, query_arxiv, fetch_url, compute
 │   ├── rag_query.py                   # pre-LLM sqlite-vec KNN retrieval
 │   ├── debate_runner.py               # tool loop + multi-round debate + Git barriers
@@ -242,6 +242,11 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 
 ### Adding an agent
 
+The shipped roster is **100 uniform research agents** (`research_agent_01` …
+`research_agent_100`): every one carries the same evidence-first mandate and the full
+tool set, so the debate samples 100 independent readings of the mission. To specialize
+an agent, edit its `system_prompt` in `agents/system_prompts.json`.
+
 Add a key to `agents/system_prompts.json` — nothing else. A `roster` job in both
 workflows reads that file at run time and builds the matrix from it (branch names,
 the peer roster for the Git barrier, fan-in collection and consolidation all derive
@@ -249,16 +254,16 @@ from the same file).
 
 ### Trimming the roster (no other edits needed)
 
-**Deleting persona keys is the trim mechanism** — matrix, peer roster, fan-in and
+**Deleting agent keys is the trim mechanism** — matrix, peer roster, fan-in and
 consolidation all shrink to the remaining keys on the next run:
 
 ```bash
 python3 - <<'PY'
 import json, pathlib
 p = pathlib.Path("agents/system_prompts.json")
-personas = json.loads(p.read_text())
-keep = ["researcher", "security_auditor", "synthesizer"]  # any subset you want
-p.write_text(json.dumps({k: personas[k] for k in keep}, indent=2) + "\n")
+roster = json.loads(p.read_text())
+keep = ["research_agent_01", "research_agent_02", "research_agent_03"]  # any subset you want
+p.write_text(json.dumps({k: roster[k] for k in keep}, indent=2) + "\n")
 PY
 ```
 
@@ -312,8 +317,8 @@ Safety and cost controls:
 * Tool failures return an error JSON instead of raising — a broken network never kills a debate.
 * The per-round budget is `max_tool_iterations` (config); when it is exhausted the agents
   are told to answer with what they have.
-* The per-persona `tools` list in `system_prompts.json` scopes who may call what
-  (e.g. a synthesizer can be denied `search_web`).
+* The per-agent `tools` list in `system_prompts.json` scopes who may call what
+  (e.g. you can deny one research agent `search_web`).
 
 Each agent writes its evidence trail to `output/tool_trace_round_<r>.json`; the
 consolidator stores it in the `tool_trace_json` column and renders it into
@@ -328,7 +333,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 export TASK_PROMPT="Architect a Byzantine-fault-tolerant distributed rate limiter."
-export AGENT_ID=researcher
+export AGENT_ID=research_agent_01
 export GITHUB_RUN_ID=local-1
 
 # 1) retrieval (safe no-op without a knowledge base)
@@ -368,7 +373,7 @@ ORDER BY v.distance ASC;
 | `APITimeoutError` during round 1 | Cold 32k-ctx CPU prefill exceeds the OpenAI SDK's default 600 s timeout | Already raised: `llm_timeout_sec` in `model_config.json` (default 1800 s) or `LLM_TIMEOUT_SEC`; shrink `ctx_size`/RAG depth if prefill is still slower than that. |
 | `llama-server did not become healthy` | Bad flag combination in `llama_server_flags` | Inspect the printed server log tail; verify the flag exists in your pinned build. |
 | Vector search returns nothing | No `knowledge_base.db` yet, or `embedding_dim` changed | Run the debate once to populate it; keep `embedding_dim` in sync with `embedding_model`. |
-| Agents never call tools | Chat template without tool support, or tools disabled | Keep `--jinja` on the server launch (already set) and `enable_tools: true`; check the persona's `tools` list. |
+| Agents never call tools | Chat template without tool support, or tools disabled | Keep `--jinja` on the server launch (already set) and `enable_tools: true`; check the agent's `tools` list. |
 | `search_web` returns no results | Datacenter IP rate limited by DuckDuckGo | Expected: the tool falls back to DuckDuckGo Instant Answer, then Wikipedia, and repeated lookups are served from the runner-local tool cache. Set `TOOL_ALLOWLIST=query_arxiv,compute` to work arxiv-only. |
 | Tool output floods the context | Page larger than the context window | Lower `max_chars` in the model's call, or set `MAX_TOOL_RESULT_CHARS` lower (default 6 000). |
 | Cache restore is slow / misses | Cache key includes the GGUF filename and `llama_cpp_release` | Expected: a new model or pinned build produces a new key. |

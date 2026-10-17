@@ -183,7 +183,7 @@ def synthesize(query: str, hits: list[dict], config: dict) -> tuple[str | None, 
                     "content": (
                         "You are the synthesis engine of a multi-agent research swarm. Answer the "
                         "question strictly from the retrieved findings, citing evidence inline like "
-                        "`[researcher · round 2 · run 123456]` using the agent_id, round and run_id "
+                        "`[research_agent_01 · round 2 · run 123456]` using the agent_id, round and run_id "
                         "fields. Call out consensus, disagreements between agents, and unresolved "
                         "risks. Plain markdown, concise. Never invent citations. /no_think"
                     ),

@@ -24,7 +24,7 @@ Environment variables
 AGENT_ID             Agent role, must be a key of system_prompts.json (required)
 TASK_PROMPT          Debate topic (required)
 GITHUB_RUN_ID        Run identifier used to reject stale peer state (required)
-ALL_AGENTS           Comma separated roster (default: researcher,security_auditor,synthesizer)
+ALL_AGENTS           Comma separated roster (default: research_agent_01..03)
 CONFIG_PATH          Path to model_config.json (default: external_config/model_config.json)
 SYSTEM_PROMPTS_PATH  Persona file (default: agents/system_prompts.json)
 RAG_CONTEXT_PATH     Retrieved vector memory from rag_query.py (default: /tmp/rag_context.json)
@@ -71,7 +71,7 @@ SYSTEM_PROMPTS_PATH = Path(
 RAG_CONTEXT_PATH = Path(os.environ.get("RAG_CONTEXT_PATH", "/tmp/rag_context.json"))
 OUTPUT_DIR = Path("output")
 
-DEFAULT_AGENTS = ["researcher", "security_auditor", "synthesizer"]
+DEFAULT_AGENTS = ["research_agent_01", "research_agent_02", "research_agent_03"]
 DEFAULT_PEER_TIMEOUT_SEC = 1800
 POLL_INTERVAL_SEC = 6
 
