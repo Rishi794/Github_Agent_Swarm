@@ -1,0 +1,389 @@
+name: Multi-Agent Debate Swarm (llama.cpp + sqlite-vec)
+
+# Fan-out / fan-in topology
+#   main              -> orchestration (this file + agents/*.py)
+#   agent-state/<id>  -> per-agent, collision-free debate transcript per round
+#   central-storage   -> orphan branch holding knowledge_base.db (sqlite-vec) + dashboard
+#
+# Model configuration is read at runtime from a SEPARATE repository (see `config_repo`),
+# so models/flags/rounds can be hot-swapped without touching this codebase.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_prompt:
+        description: 'Problem statement for the multi-agent debate swarm'
+        required: true
+        default: 'Architect a Byzantine-fault-tolerant distributed rate limiter across multi-region edge nodes.'
+      config_repo:
+        description: 'External GitHub repository containing model_config.json (owner/repo)'
+        required: true
+        default: 'Rishi794/Model_Config'
+      config_ref:
+        description: 'Branch or tag in the external model config repository'
+        required: true
+        default: 'main'
+      rounds_override:
+        description: 'Optional: override debate_rounds (leave empty to use model_config.json)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# Serialize whole runs so agent-state branches are never rewritten mid-debate.
+concurrency:
+  group: swarm-debate
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # JOB 1: Parallel multi-round debate, one isolated branch per agent
+  # =========================================================================
+  debate-agents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        agent_id: [researcher, security_auditor, synthesizer]
+
+    steps:
+      - name: Checkout Swarm Execution Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout External Model Configuration Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.config_repo }}
+          ref: ${{ inputs.config_ref }}
+          path: external_config
+          token: ${{ secrets.CONFIG_REPO_TOKEN || github.token }}
+
+      - name: Configure 4GB Swap & Reclaim Disk Space (OOM Guard)
+        run: |
+          set -euo pipefail
+          echo "--- memory before ---"; free -m
+          echo "--- disk before ---"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -f /swapfile
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=10
+          echo "--- memory after ---"; free -m
+
+      - name: Fetch Persistent sqlite-vec Database from Central Storage
+        continue-on-error: true
+        run: |
+          mkdir -p central_memory
+          if git fetch origin central-storage 2>/dev/null; then
+            git show origin/central-storage:knowledge_base.db > central_memory/knowledge_base.db \
+              || rm -f central_memory/knowledge_base.db
+            ls -lh central_memory/ || true
+          else
+            echo "No central-storage branch yet -> starting with empty vector memory."
+          fi
+
+      - name: Parse External Model Config
+        id: model_cfg
+        env:
+          ROUNDS_OVERRIDE: ${{ inputs.rounds_override }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          with open("external_config/model_config.json", encoding="utf-8") as fh:
+              cfg = json.load(fh)
+          flags = cfg["llama_server_flags"]
+          rounds = os.environ.get("ROUNDS_OVERRIDE") or cfg.get("debate_rounds", 2)
+          cache_key = f"{cfg['hf_repo']}-{cfg['hf_file']}".replace("/", "-")
+          print(f"hf_repo={cfg['hf_repo']}")
+          print(f"hf_file={cfg['hf_file']}")
+          print(f"model_alias={cfg['model_alias']}")
+          print(f"rounds={rounds}")
+          print(f"llama_cpp_release={cfg.get('llama_cpp_release', 'auto')}")
+          print(f"cache_key=llama-{cache_key}-{cfg.get('llama_cpp_release', 'auto')}")
+          print(
+              "flags="
+              f"-t {flags['threads']} -tb {flags['threads_batch']} -c {flags['ctx_size']} "
+              f"-b {flags['batch_size']} -ub {flags['ubatch_size']} -np {flags['parallel_slots']} "
+              f"-ctk {flags['cache_type_k']} -ctv {flags['cache_type_v']} "
+              f"-lm {flags['load_mode']} -fa {flags['flash_attn']}"
+          )
+          PY
+          echo "Configured model: ${{ steps.model_cfg.outputs.hf_repo }}" || true
+
+      - name: Set up Python & Cache Dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python Packages
+        run: pip install -r requirements.txt
+
+      - name: Run Pre-LLM Vector RAG Search (Isolated Process to Save RAM)
+        env:
+          TASK_PROMPT: ${{ inputs.task_prompt }}
+          CONFIG_PATH: external_config/model_config.json
+          KB_DB_PATH: central_memory/knowledge_base.db
+          RAG_CONTEXT_PATH: /tmp/rag_context.json
+        run: python agents/rag_query.py
+
+      - name: Cache GGUF Weights, llama.cpp Binaries & Embedding Weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/gguf_models
+            ~/.cache/llama_bin
+            ~/.cache/fastembed
+          key: ${{ steps.model_cfg.outputs.cache_key }}
+
+      - name: Download Prebuilt llama-server & GGUF Weights
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_REPO: ${{ steps.model_cfg.outputs.hf_repo }}
+          HF_FILE: ${{ steps.model_cfg.outputs.hf_file }}
+          LLAMA_CPP_RELEASE: ${{ steps.model_cfg.outputs.llama_cpp_release }}
+        run: |
+          set -euo pipefail
+          BIN_DIR="$HOME/.cache/llama_bin"
+          MODEL_DIR="$HOME/.cache/gguf_models"
+          mkdir -p "$BIN_DIR" "$MODEL_DIR"
+
+          if [ ! -x "$BIN_DIR/llama-server" ]; then
+            echo "Resolving llama.cpp Linux x64 CPU build (requested: $LLAMA_CPP_RELEASE) ..."
+            ASSET_URL=$(python3 - <<'PY'
+          import json, os, urllib.request
+
+          TOKEN = os.environ.get("GH_TOKEN", "")
+          WANTED = os.environ.get("LLAMA_CPP_RELEASE", "auto").strip()
+          SUFFIX = "bin-ubuntu-x64.tar.gz"   # plain CPU build (no cuda/rocm/vulkan/sycl/openvino)
+
+
+          def api(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {TOKEN}",
+                      "User-Agent": "multi-agent-swarm-setup",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+
+          def asset_for(release):
+              for asset in release.get("assets", []):
+                  name = asset["name"]
+                  if name.endswith(SUFFIX) and "cudart" not in name:
+                      return asset["browser_download_url"]
+              return None
+
+
+          url = None
+          if WANTED and WANTED.lower() != "auto":
+              url = asset_for(api(f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{WANTED}"))
+              if url is None:
+                  raise SystemExit(f"No {SUFFIX} asset found for pinned release {WANTED}")
+          else:
+              releases = api("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=40")
+              for release in releases:
+                  url = asset_for(release)
+                  if url:
+                      print(f"# using {release['tag_name']}", file=os.sys.stderr)
+                      break
+              if url is None:
+                  raise SystemExit("No Linux x64 CPU llama.cpp build found in the last 40 releases")
+
+          print(url)
+          PY
+          )
+            curl -fL "$ASSET_URL" -o /tmp/llama.tar.gz
+            # Tarballs contain a single top-level directory (llama-bXXXXX/) with all libs + bins.
+            tar -xzf /tmp/llama.tar.gz -C "$BIN_DIR" --strip-components=1
+            chmod +x "$BIN_DIR/llama-server"
+            rm -f /tmp/llama.tar.gz
+          fi
+          "$BIN_DIR/llama-server" --version | head -n 5
+
+          if [ ! -f "$MODEL_DIR/$HF_FILE" ]; then
+            echo "Downloading $HF_REPO/$HF_FILE ..."
+            if command -v hf >/dev/null 2>&1; then
+              hf download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR"
+            else
+              huggingface-cli download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR"
+            fi
+          fi
+          ls -lh "$MODEL_DIR"
+
+      - name: Boot CPU-Optimized llama-server & Execute Multi-Round Debate
+        env:
+          AGENT_ID: ${{ matrix.agent_id }}
+          TASK_PROMPT: ${{ inputs.task_prompt }}
+          ALL_AGENTS: "researcher,security_auditor,synthesizer"
+          ROUNDS_OVERRIDE: ${{ inputs.rounds_override }}
+          CONFIG_PATH: external_config/model_config.json
+          PROMPTS_PATH: agents/prompts.json
+          RAG_CONTEXT_PATH: /tmp/rag_context.json
+          LLAMA_BASE_URL: http://127.0.0.1:8080/v1
+          LLAMA_FLAGS: ${{ steps.model_cfg.outputs.flags }}
+          HF_FILE: ${{ steps.model_cfg.outputs.hf_file }}
+          MODEL_ALIAS: ${{ steps.model_cfg.outputs.model_alias }}
+          # Prebuilt libs live next to the binary; keep the dynamic loader pointed at them.
+          LD_LIBRARY_PATH: ${{ runner.home }}/.cache/llama_bin
+        run: |
+          set -euo pipefail
+          BIN_DIR="$HOME/.cache/llama_bin"
+          MODEL_DIR="$HOME/.cache/gguf_models"
+
+          git config user.name "agent-${AGENT_ID}[bot]"
+          git config user.email "${AGENT_ID}@users.noreply.github.com"
+
+          # Single model load for ALL debate rounds: llama-server stays warm while the
+          # runner loops through rounds and synchronizes via git branches.
+          "$BIN_DIR/llama-server" \
+            -m "$MODEL_DIR/$HF_FILE" \
+            --alias "$MODEL_ALIAS" \
+            --host 127.0.0.1 --port 8080 \
+            $LLAMA_FLAGS \
+            > /tmp/llama-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          echo "Waiting for llama-server readiness..."
+          READY=0
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "::error::llama-server exited during startup"
+              tail -n 80 /tmp/llama-server.log
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::llama-server did not become healthy within 180s"
+            tail -n 80 /tmp/llama-server.log
+            exit 1
+          fi
+          echo "llama-server healthy (pid $SERVER_PID). Memory:"; free -m
+
+          python agents/debate_runner.py
+          echo "--- server log tail ---"
+          tail -n 20 /tmp/llama-server.log
+
+      - name: Upload Debate Round Outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debate-output-${{ matrix.agent_id }}
+          path: output/
+          if-no-files-found: ignore
+
+  # =========================================================================
+  # JOB 2: Fan-in — consolidate every round into the persistent sqlite-vec
+  #        knowledge base on the central-storage branch (single writer)
+  # =========================================================================
+  consolidate-sqlite-storage:
+    needs: debate-agents
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      # Guarantees a single writer per branch, so pushes never conflict.
+      group: central-storage-writer
+      cancel-in-progress: false
+    steps:
+      - name: Checkout Swarm Execution Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout External Model Configuration Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.config_repo }}
+          ref: ${{ inputs.config_ref }}
+          path: external_config
+          token: ${{ secrets.CONFIG_REPO_TOKEN || github.token }}
+
+      - name: Set up Python & Cache Dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python Packages
+        run: pip install -r requirements.txt
+
+      - name: Collect All Debate Round Outputs from Agent Branches
+        env:
+          ROUNDS_OVERRIDE: ${{ inputs.rounds_override }}
+        run: |
+          set -euo pipefail
+          mkdir -p incoming_findings
+          ROUNDS=$(python3 -c 'import json, os; print(os.environ.get("ROUNDS_OVERRIDE") or json.load(open("external_config/model_config.json"))["debate_rounds"])')
+          AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/prompts.json")).keys()))')
+          echo "Collecting rounds=$ROUNDS for agents: $AGENTS"
+          for agent in $AGENTS; do
+            git fetch origin "agent-state/$agent"
+            for r in $(seq 1 "$ROUNDS"); do
+              git show "origin/agent-state/$agent:output/round_${r}.json" \
+                > "incoming_findings/round_${r}_${agent}.json"
+            done
+          done
+          ls -lh incoming_findings/
+
+      - name: Fetch Existing Knowledge Base from Central Storage
+        continue-on-error: true
+        run: |
+          mkdir -p central_memory
+          if git fetch origin central-storage 2>/dev/null; then
+            git show origin/central-storage:knowledge_base.db > central_memory/knowledge_base.db \
+              || rm -f central_memory/knowledge_base.db
+            ls -lh central_memory/ || true
+          else
+            echo "No central-storage branch yet -> creating a fresh knowledge base."
+          fi
+
+      - name: Embed Findings & Update sqlite-vec Database
+        env:
+          CONFIG_PATH: external_config/model_config.json
+          INCOMING_DIR: incoming_findings
+          KB_DB_PATH: central_memory/knowledge_base.db
+          REPORT_PATH: central_memory/README.md
+        run: python agents/consolidate_sqlite.py
+
+      - name: Publish Database & Dashboard to Central Storage Branch
+        run: |
+          set -euo pipefail
+          git config user.name "sqlite-vec-merger[bot]"
+          git config user.email "merger@users.noreply.github.com"
+
+          git fetch origin central-storage 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/central-storage; then
+            git checkout -B central-storage origin/central-storage
+          else
+            git checkout --orphan central-storage
+            git rm -rf --cached . > /dev/null
+          fi
+
+          cp central_memory/knowledge_base.db knowledge_base.db
+          cp central_memory/README.md README.md
+          git add -f knowledge_base.db README.md
+
+          if git diff --cached --quiet; then
+            echo "No knowledge-base changes to publish."
+          else
+            git commit -m "storage(sqlite-vec): index multi-round debate findings (run #${{ github.run_number }})"
+            git push origin central-storage
+            echo "Published knowledge_base.db + README.md to central-storage."
+          fi

@@ -1,0 +1,14 @@
+{
+  "researcher": {
+    "role": "Lead Technical Researcher",
+    "focus": "Establish empirical facts, system constraints, algorithmic bounds, and concrete architectural mechanisms."
+  },
+  "security_auditor": {
+    "role": "Principal Security & Resilience Auditor",
+    "focus": "Expose failure modes, race conditions, resource exhaustion vectors, and security vulnerabilities in peer proposals."
+  },
+  "synthesizer": {
+    "role": "Staff Systems Architect",
+    "focus": "Resolve trade-offs between research capabilities and security constraints into a production-ready design."
+  }
+}

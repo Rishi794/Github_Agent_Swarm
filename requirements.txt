@@ -1,0 +1,5 @@
+openai>=1.50.0
+pydantic>=2.9.0
+sqlite-vec>=0.1.6
+fastembed>=0.4.0
+huggingface-hub>=0.31.0
