@@ -212,6 +212,25 @@ workflows reads that file at run time and builds the matrix from it (branch name
 the peer roster for the Git barrier, fan-in collection and consolidation all derive
 from the same file).
 
+### Trimming the roster (no other edits needed)
+
+**Deleting persona keys is the trim mechanism** — matrix, peer roster, fan-in and
+consolidation all shrink to the remaining keys on the next run:
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("agents/system_prompts.json")
+personas = json.loads(p.read_text())
+keep = ["researcher", "security_auditor", "synthesizer"]  # any subset you want
+p.write_text(json.dumps({k: personas[k] for k in keep}, indent=2) + "\n")
+PY
+```
+
+Leftover `agent-state/<removed>` branches are simply ignored by fan-in; delete them
+with `git push origin --delete agent-state/<agent>` if you want a clean branch list.
+Re-adding a key later is safe: consolidation dedupes by `(run_id, agent_id, round)`.
+
 ### Scaling to a large roster (why 100 agents survive here)
 
 * GitHub builds up to **256 matrix jobs per run**; the shipped roster has **100**.
