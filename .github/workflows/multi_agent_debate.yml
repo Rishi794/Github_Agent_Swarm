@@ -47,15 +47,46 @@ concurrency:
 
 jobs:
   # =========================================================================
+  # JOB 0: Roster — the agent list is data, not YAML: it is read from
+  #        agents/system_prompts.json so adding a persona key adds a matrix
+  #        leg automatically. (GitHub limit: 256 matrix jobs per run.)
+  # =========================================================================
+  roster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      agents: ${{ steps.roster.outputs.agents }}
+      agents_csv: ${{ steps.roster.outputs.agents_csv }}
+    steps:
+      - name: Checkout Swarm Execution Repository
+        uses: actions/checkout@v4
+
+      - name: Build Matrix Roster from Personas
+        id: roster
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open("agents/system_prompts.json", encoding="utf-8") as fh:
+              roster = list(json.load(fh))
+          if not roster:
+              raise SystemExit("system_prompts.json defines no agents")
+          print("agents=" + json.dumps(roster))
+          print("agents_csv=" + ",".join(roster))
+          print(f"Roster: {len(roster)} agents")
+          PY
+
+  # =========================================================================
   # JOB 1: Parallel multi-round debate, one isolated branch per agent
   # =========================================================================
   debate-agents:
+    needs: roster
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        agent_id: [researcher, security_auditor, synthesizer]
+        agent_id: ${{ fromJSON(needs.roster.outputs.agents) }}
 
     steps:
       - name: Checkout Swarm Execution Repository
@@ -215,6 +246,9 @@ jobs:
         run: python agents/rag_query.py
 
       - name: Cache GGUF Weights, llama.cpp Binaries & Embedding Weights
+        # Large rosters restore this cache from many concurrent legs; a throttled
+        # cache service must never fail a leg (the download step self-heals).
+        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: |
@@ -284,7 +318,7 @@ jobs:
           print(url)
           PY
           )
-            curl -fL "$ASSET_URL" -o /tmp/llama.tar.gz
+            curl -fL --retry 5 --retry-all-errors --retry-delay 5 "$ASSET_URL" -o /tmp/llama.tar.gz
             # Tarballs contain a single top-level directory (llama-bXXXXX/) with all libs + bins.
             tar -xzf /tmp/llama.tar.gz -C "$BIN_DIR" --strip-components=1
             chmod +x "$BIN_DIR/llama-server"
@@ -306,7 +340,7 @@ jobs:
         env:
           AGENT_ID: ${{ matrix.agent_id }}
           TASK_PROMPT: ${{ steps.task_prompt.outputs.prompt }}
-          ALL_AGENTS: "researcher,security_auditor,synthesizer"
+          ALL_AGENTS: ${{ needs.roster.outputs.agents_csv }}
           ROUNDS_OVERRIDE: ${{ inputs.rounds_override }}
           CONFIG_PATH: external_config/model_config.json
           SYSTEM_PROMPTS_PATH: agents/system_prompts.json
@@ -421,10 +455,18 @@ jobs:
           AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/system_prompts.json")).keys()))')
           echo "Collecting rounds=$ROUNDS for agents: $AGENTS"
           for agent in $AGENTS; do
-            git fetch origin "agent-state/$agent"
+            # A large roster always loses a leg or two; a missing branch or a
+            # partial round must skip that file, not abort the fan-in.
+            if ! git fetch origin "agent-state/$agent" 2>/dev/null; then
+              echo "::warning::No agent-state/$agent branch (leg failed or skipped); continuing."
+              continue
+            fi
             for r in $(seq 1 "$ROUNDS"); do
-              git show "origin/agent-state/$agent:output/round_${r}.json" \
-                > "incoming_findings/round_${r}_${agent}.json"
+              if ! git show "origin/agent-state/$agent:output/round_${r}.json" \
+                > "incoming_findings/round_${r}_${agent}.json" 2>/dev/null; then
+                echo "::warning::$agent has no round ${r} output; skipping."
+                rm -f "incoming_findings/round_${r}_${agent}.json"
+              fi
             done
           done
           ls -lh incoming_findings/

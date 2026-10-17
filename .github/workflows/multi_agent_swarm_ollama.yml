@@ -43,15 +43,43 @@ env:
 
 jobs:
   # =========================================================================
+  # JOB 0: Roster — read from agents/system_prompts.json; adding a persona key
+  #        adds a matrix leg automatically (GitHub limit: 256 matrix jobs/run).
+  # =========================================================================
+  roster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      agents: ${{ steps.roster.outputs.agents }}
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Build Matrix Roster from Personas
+        id: roster
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open("agents/system_prompts.json", encoding="utf-8") as fh:
+              roster = list(json.load(fh))
+          if not roster:
+              raise SystemExit("system_prompts.json defines no agents")
+          print("agents=" + json.dumps(roster))
+          print(f"Roster: {len(roster)} agents")
+          PY
+
+  # =========================================================================
   # JOB 1: Parallel agents, each writing to its own branch
   # =========================================================================
   run-agents:
+    needs: roster
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        agent_id: [researcher, security_auditor, synthesizer]
+        agent_id: ${{ fromJSON(needs.roster.outputs.agents) }}
 
     steps:
       - name: Checkout Code Repository
@@ -127,6 +155,9 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
 
       - name: Cache Ollama Model Weights
+        # Large rosters restore this cache concurrently; a throttled cache
+        # service must not fail a leg (the pull step self-heals).
+        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: ~/.ollama/models
@@ -224,9 +255,16 @@ jobs:
           mkdir -p incoming_findings
           AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/system_prompts.json")).keys()))')
           for agent in $AGENTS; do
-            git fetch origin "agent-state/$agent"
-            git show "origin/agent-state/$agent:output/${agent}_finding.json" \
-              > "incoming_findings/${agent}_finding.json"
+            # A large roster always loses a leg or two; skip missing branches.
+            if ! git fetch origin "agent-state/$agent" 2>/dev/null; then
+              echo "::warning::No agent-state/$agent branch (leg failed or skipped); continuing."
+              continue
+            fi
+            if ! git show "origin/agent-state/$agent:output/${agent}_finding.json" \
+              > "incoming_findings/${agent}_finding.json" 2>/dev/null; then
+              echo "::warning::$agent has no finding output; skipping."
+              rm -f "incoming_findings/${agent}_finding.json"
+            fi
           done
           ls -lh incoming_findings/
 

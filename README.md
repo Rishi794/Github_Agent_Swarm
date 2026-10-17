@@ -27,7 +27,8 @@ tune a flag by editing one JSON file — no code change, no redeploy.
                                         │ actions/checkout (path: external_config/)
                                         ▼
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ JOB 1  debate-agents  (matrix: researcher | security_auditor | synthesizer)    │
+│ JOB 0  roster  (reads agents/system_prompts.json — currently 100 personas)     │
+│ JOB 1  debate-agents  (matrix = roster keys; one isolated leg per agent)      │
 │                                                                               │
 │  rag_query.py  ──►  /tmp/rag_context.json   (embeddings, then process exits)   │
 │        │                                                                      │
@@ -58,9 +59,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 | Branch | Writer | Contents |
 | --- | --- | --- |
 | `main` | you | Workflows and Python orchestration only. Never receives automated data commits. |
-| `agent-state/researcher` | researcher runner only | `output/round_<r>.json`, `output/latest.json` |
-| `agent-state/security_auditor` | security auditor runner only | same |
-| `agent-state/synthesizer` | synthesizer runner only | same |
+| `agent-state/<agent_id>` (one per persona; 100 today) | that persona's runner only | `output/round_<r>.json`, `output/latest.json` |
 | `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard |
 
 One writer per ref means parallel runners can never produce `non-fast-forward`
@@ -208,9 +207,28 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 
 ### Adding an agent
 
-Add a key to `agents/system_prompts.json` **and** to the `matrix.agent_id` list in both
-workflows. Everything else (branch names, collection, consolidation) derives from
-that list at runtime.
+Add a key to `agents/system_prompts.json` — nothing else. A `roster` job in both
+workflows reads that file at run time and builds the matrix from it (branch names,
+the peer roster for the Git barrier, fan-in collection and consolidation all derive
+from the same file).
+
+### Scaling to a large roster (why 100 agents survive here)
+
+* GitHub builds up to **256 matrix jobs per run**; the shipped roster has **100**.
+* Jobs execute **20 at a time** on Free (40 Pro / 60 Team / 500 Enterprise), so a
+  100-leg run flows through ~5 waves. Queue time does not count against a leg's
+  `timeout-minutes`, and the `swarm-debate` concurrency group keeps runs serialized.
+* The Git barrier is **bounded**: `peer_sync_count` in `model_config.json` (currently
+  `8`) lets each agent sync with the first N peers that publish a round instead of all
+  99. If the timeout hits with partial data, the agent logs
+  `Peer sync incomplete ... proceeding` and finishes; it fails only when **no** peer
+  published at all. Set `peer_sync_count: 0` for the strict all-peers barrier (small
+  rosters). Peer scanning starts at a per-agent offset so agents sample different peers.
+* The first run against a cold `actions/cache` is the expensive one: every leg
+  downloads the GGUF/Ollama weights once. Later runs restore from cache, and the cache
+  steps are `continue-on-error` so a throttled cache service can never fail a leg.
+* Fan-in tolerates lost legs: missing `agent-state/*` branches and partial rounds are
+  skipped with a `::warning::` instead of aborting consolidation.
 
 ---
 
@@ -284,7 +302,7 @@ ORDER BY v.distance ASC;
 | --- | --- | --- |
 | Exit code 137 | Runner RAM exhausted | Lower `ctx_size`, use a smaller quant/model, keep `-np 1`. |
 | `No ... asset found` during model download | Pinned `llama_cpp_release` has no Linux CPU build | Set `llama_cpp_release` back to `"auto"`. |
-| `Timed out waiting for peers` | A peer agent failed or is very slow | Raise `peer_timeout_sec`; check the failing matrix leg. |
+| `Timed out ... no peer published` | Every peer in the barrier target failed or is very slow | Raise `peer_timeout_sec`; check the failing matrix legs. A *partial* timeout no longer fails — the runner logs `Peer sync incomplete ... proceeding` and continues. |
 | `llama-server did not become healthy` | Bad flag combination in `llama_server_flags` | Inspect the printed server log tail; verify the flag exists in your pinned build. |
 | Vector search returns nothing | No `knowledge_base.db` yet, or `embedding_dim` changed | Run the debate once to populate it; keep `embedding_dim` in sync with `embedding_model`. |
 | Agents never call tools | Chat template without tool support, or tools disabled | Keep `--jinja` on the server launch (already set) and `enable_tools: true`; check the persona's `tools` list. |
