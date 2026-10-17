@@ -7,6 +7,10 @@ name: Multi-Agent Debate Swarm (llama.cpp + sqlite-vec)
 #
 # Model configuration is read at runtime from a SEPARATE repository (see `config_repo`),
 # so models/flags/rounds can be hot-swapped without touching this codebase.
+#
+# Agents are tool-enabled: mid-reasoning they may call `search_web`, `query_arxiv`,
+# `fetch_url`, and `compute` (see agents/agent_tools.py) before producing each round's
+# structured thesis. Everything lands in agentic_results.md on `central-storage`.
 
 on:
   workflow_dispatch:
@@ -95,12 +99,19 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os
+          import json, os, sys
           with open("external_config/model_config.json", encoding="utf-8") as fh:
               cfg = json.load(fh)
           flags = cfg["llama_server_flags"]
           rounds = os.environ.get("ROUNDS_OVERRIDE") or cfg.get("debate_rounds", 2)
           cache_key = f"{cfg['hf_repo']}-{cfg['hf_file']}".replace("/", "-")
+          print(
+              f"configured model: {cfg['hf_repo']}/{cfg['hf_file']} "
+              f"alias={cfg['model_alias']} rounds={rounds} "
+              f"tools={cfg.get('enable_tools', True)} "
+              f"tool_budget={cfg.get('max_tool_iterations', 3)}",
+              file=sys.stderr,
+          )
           print(f"hf_repo={cfg['hf_repo']}")
           print(f"hf_file={cfg['hf_file']}")
           print(f"model_alias={cfg['model_alias']}")
@@ -115,7 +126,6 @@ jobs:
               f"-lm {flags['load_mode']} -fa {flags['flash_attn']}"
           )
           PY
-          echo "Configured model: ${{ steps.model_cfg.outputs.hf_repo }}" || true
 
       - name: Set up Python & Cache Dependencies
         uses: actions/setup-python@v5
@@ -229,28 +239,33 @@ jobs:
           ALL_AGENTS: "researcher,security_auditor,synthesizer"
           ROUNDS_OVERRIDE: ${{ inputs.rounds_override }}
           CONFIG_PATH: external_config/model_config.json
-          PROMPTS_PATH: agents/prompts.json
+          SYSTEM_PROMPTS_PATH: agents/system_prompts.json
           RAG_CONTEXT_PATH: /tmp/rag_context.json
           LLAMA_BASE_URL: http://127.0.0.1:8080/v1
           LLAMA_FLAGS: ${{ steps.model_cfg.outputs.flags }}
           HF_FILE: ${{ steps.model_cfg.outputs.hf_file }}
           MODEL_ALIAS: ${{ steps.model_cfg.outputs.model_alias }}
-          # Prebuilt libs live next to the binary; keep the dynamic loader pointed at them.
-          LD_LIBRARY_PATH: ${{ runner.home }}/.cache/llama_bin
+          MAX_TOOL_RESULT_CHARS: "6000"
         run: |
           set -euo pipefail
           BIN_DIR="$HOME/.cache/llama_bin"
           MODEL_DIR="$HOME/.cache/gguf_models"
+          # Prebuilt libs live next to the binary; keep the dynamic loader pointed at them.
+          export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
           git config user.name "agent-${AGENT_ID}[bot]"
           git config user.email "${AGENT_ID}@users.noreply.github.com"
 
           # Single model load for ALL debate rounds: llama-server stays warm while the
           # runner loops through rounds and synchronizes via git branches.
+          # --jinja enables the model's real chat template, which is what makes
+          # native tool calling (search_web / query_arxiv / fetch_url / compute) work.
+          # shellcheck disable=SC2086  # LLAMA_FLAGS must word-split into separate CLI args.
           "$BIN_DIR/llama-server" \
             -m "$MODEL_DIR/$HF_FILE" \
             --alias "$MODEL_ALIAS" \
             --host 127.0.0.1 --port 8080 \
+            --jinja \
             $LLAMA_FLAGS \
             > /tmp/llama-server.log 2>&1 &
           SERVER_PID=$!
@@ -331,7 +346,7 @@ jobs:
           set -euo pipefail
           mkdir -p incoming_findings
           ROUNDS=$(python3 -c 'import json, os; print(os.environ.get("ROUNDS_OVERRIDE") or json.load(open("external_config/model_config.json"))["debate_rounds"])')
-          AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/prompts.json")).keys()))')
+          AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/system_prompts.json")).keys()))')
           echo "Collecting rounds=$ROUNDS for agents: $AGENTS"
           for agent in $AGENTS; do
             git fetch origin "agent-state/$agent"
@@ -360,9 +375,10 @@ jobs:
           INCOMING_DIR: incoming_findings
           KB_DB_PATH: central_memory/knowledge_base.db
           REPORT_PATH: central_memory/README.md
+          AGENTIC_REPORT_PATH: central_memory/agentic_results.md
         run: python agents/consolidate_sqlite.py
 
-      - name: Publish Database & Dashboard to Central Storage Branch
+      - name: Publish Database & Reports to Central Storage Branch
         run: |
           set -euo pipefail
           git config user.name "sqlite-vec-merger[bot]"
@@ -378,12 +394,13 @@ jobs:
 
           cp central_memory/knowledge_base.db knowledge_base.db
           cp central_memory/README.md README.md
-          git add -f knowledge_base.db README.md
+          cp central_memory/agentic_results.md agentic_results.md
+          git add -f knowledge_base.db README.md agentic_results.md
 
           if git diff --cached --quiet; then
             echo "No knowledge-base changes to publish."
           else
-            git commit -m "storage(sqlite-vec): index multi-round debate findings (run #${{ github.run_number }})"
+            git commit -m "storage(sqlite-vec): index debate findings + agentic_results.md (run #${{ github.run_number }})"
             git push origin central-storage
-            echo "Published knowledge_base.db + README.md to central-storage."
+            echo "Published knowledge_base.db, agentic_results.md and README.md to central-storage."
           fi

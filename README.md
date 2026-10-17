@@ -32,11 +32,11 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 │  rag_query.py  ──►  /tmp/rag_context.json   (embeddings, then process exits)   │
 │        │                                                                      │
 │        ▼                                                                      │
-│  llama-server  (loaded ONCE, -np 1, q8_0 KV, -lm mmap)                        │
+│  llama-server  (loaded ONCE, -np 1, q8_0 KV, -lm mmap, --jinja for tools)      │
 │        │                                                                      │
 │        ▼                                                                      │
-│  debate_runner.py:  round 1 ──► push ──► barrier ──► round 2 ──► push ──► …    │
-│        │                    │                        │                        │
+│  debate_runner.py:  tool loop ─► round 1 ─► push ─► barrier ─► round 2 ─► …    │
+│        │            (search_web / query_arxiv / fetch_url / compute)          │
 │        └────────────────────┴────────────────────────┘                        │
 │                     git push → agent-state/<agent_id>  (one writer per ref)    │
 └───────────────────────────────────┬───────────────────────────────────────────┘
@@ -47,8 +47,9 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 │                                                                               │
 │  fetch all agent-state/* branches → embed findings → knowledge_base.db        │
 │      (SQLite + sqlite-vec vec0 table) → WAL checkpoint → VACUUM → commit       │
+│  render agentic_results.md (transcript + tool evidence) + README.md dashboard  │
 │                                                                               │
-│  push → central-storage  (orphan branch: knowledge_base.db + README.md)        │
+│  push → central-storage  (orphan branch: knowledge_base.db + reports)          │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,7 +61,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 | `agent-state/researcher` | researcher runner only | `output/round_<r>.json`, `output/latest.json` |
 | `agent-state/security_auditor` | security auditor runner only | same |
 | `agent-state/synthesizer` | synthesizer runner only | same |
-| `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `README.md` dashboard |
+| `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard |
 
 One writer per ref means parallel runners can never produce `non-fast-forward`
 push collisions. Peers read each other with `git fetch` + `git show`, and every
@@ -70,6 +71,7 @@ Read the live state from anywhere:
 
 ```
 https://raw.githubusercontent.com/Rishi794/Github_Agent_Swarm/central-storage/README.md
+https://raw.githubusercontent.com/Rishi794/Github_Agent_Swarm/central-storage/agentic_results.md
 ```
 
 ---
@@ -83,8 +85,9 @@ https://raw.githubusercontent.com/Rishi794/Github_Agent_Swarm/central-storage/RE
 | Swap + disk cleanup | Adds a 4 GB swapfile and deletes preinstalled SDKs to guarantee headroom. |
 | RAG | `agents/rag_query.py` embeds the task with `fastembed` and KNN-searches `knowledge_base.db`. The process **exits before** `llama-server` starts, so embedding and LLM weights never share RAM. |
 | Model | Downloads a prebuilt `llama-server` (Ubuntu x64 CPU build) plus the GGUF from the config repo, cached by `actions/cache`. |
-| Debate | One `llama-server` per agent serves **all** rounds. Each round: generate → push to `agent-state/<agent>` → wait for peers → next round. |
-| Fan-in | `agents/consolidate_sqlite.py` embeds every round, appends to `knowledge_base.db`, checkpoints WAL, VACUUMs, commits to `central-storage`. |
+| Tools | `llama-server --jinja` gives the model native function calling. Each round, agents may call `search_web`, `query_arxiv`, `fetch_url`, and `compute` before answering; every call is traced. |
+| Debate | One `llama-server` per agent serves **all** rounds. Each round: tools → generate → push to `agent-state/<agent>` → wait for peers → next round. |
+| Fan-in | `agents/consolidate_sqlite.py` embeds every round, appends to `knowledge_base.db`, checkpoints WAL, VACUUMs, and writes `agentic_results.md` + `README.md` to `central-storage`. |
 
 ### `multi_agent_swarm_ollama.yml` — single-pass swarm (lightweight alternative)
 
@@ -142,10 +145,11 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 │   ├── multi_agent_debate.yml         # fan-out debate + sqlite-vec fan-in  (primary)
 │   └── multi_agent_swarm_ollama.yml   # single-pass Ollama swarm            (alternative)
 ├── agents/
-│   ├── prompts.json                   # agent personas (keys = matrix agent ids)
+│   ├── system_prompts.json            # personas + per-persona tool allowlists
+│   ├── agent_tools.py                 # search_web, query_arxiv, fetch_url, compute
 │   ├── rag_query.py                   # pre-LLM sqlite-vec KNN retrieval
-│   ├── debate_runner.py               # multi-round loop + Git barriers
-│   ├── consolidate_sqlite.py          # fan-in: embed rounds into knowledge_base.db
+│   ├── debate_runner.py               # tool loop + multi-round debate + Git barriers
+│   ├── consolidate_sqlite.py          # fan-in: vectors + agentic_results.md
 │   ├── run_agent_ollama.py            # single-pass inference (Ollama workflow)
 │   └── consolidate_json.py            # fan-in: append to knowledge_base.json
 └── requirements.txt
@@ -153,9 +157,37 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 
 ### Adding an agent
 
-Add a key to `agents/prompts.json` **and** to the `matrix.agent_id` list in both
+Add a key to `agents/system_prompts.json` **and** to the `matrix.agent_id` list in both
 workflows. Everything else (branch names, collection, consolidation) derives from
 that list at runtime.
+
+---
+
+## 4b. Tools (real-world grounding)
+
+`agents/agent_tools.py` exposes four stdlib-only functions over the OpenAI
+function-calling protocol served by `llama-server --jinja`:
+
+| Tool | Purpose | Notes |
+| --- | --- | --- |
+| `search_web(query, max_results)` | Live docs, specs, benchmarks, CVEs | DuckDuckGo HTML → DuckDuckGo Instant Answer → Wikipedia fallback chain, so a rate-limited datacenter IP still returns evidence |
+| `query_arxiv(search_query, max_results)` | Papers, preprints, formal results | Official arXiv Atom API; titles, authors, dates, abstracts |
+| `fetch_url(url, max_chars)` | Read one page as text | SSRF-guarded (blocks private/loopback hosts), 400 KB read cap, tag-stripped |
+| `compute(expression)` | Exact arithmetic | AST-restricted whitelist — no `eval`, no attribute access |
+
+Safety and cost controls:
+
+* Every result is truncated to `MAX_TOOL_RESULT_CHARS` (default 6 000) so a large page
+  cannot blow up the KV cache.
+* Tool failures return an error JSON instead of raising — a broken network never kills a debate.
+* The per-round budget is `max_tool_iterations` (config); when it is exhausted the agents
+  are told to answer with what they have.
+* The per-persona `tools` list in `system_prompts.json` scopes who may call what
+  (e.g. a synthesizer can be denied `search_web`).
+
+Each agent writes its evidence trail to `output/tool_trace_round_<r>.json`; the
+consolidator stores it in the `tool_trace_json` column and renders it into
+`agentic_results.md`.
 
 ---
 
@@ -204,4 +236,7 @@ ORDER BY v.distance ASC;
 | `Timed out waiting for peers` | A peer agent failed or is very slow | Raise `peer_timeout_sec`; check the failing matrix leg. |
 | `llama-server did not become healthy` | Bad flag combination in `llama_server_flags` | Inspect the printed server log tail; verify the flag exists in your pinned build. |
 | Vector search returns nothing | No `knowledge_base.db` yet, or `embedding_dim` changed | Run the debate once to populate it; keep `embedding_dim` in sync with `embedding_model`. |
+| Agents never call tools | Chat template without tool support, or tools disabled | Keep `--jinja` on the server launch (already set) and `enable_tools: true`; check the persona's `tools` list. |
+| `search_web` returns no results | Datacenter IP rate limited by DuckDuckGo | Expected: the tool falls back to DuckDuckGo Instant Answer, then Wikipedia. Set `TOOL_ALLOWLIST=query_arxiv,compute` to work arxiv-only. |
+| Tool output floods the context | Page larger than the context window | Lower `max_chars` in the model's call, or set `MAX_TOOL_RESULT_CHARS` lower (default 6 000). |
 | Cache restore is slow / misses | Cache key includes the GGUF filename and `llama_cpp_release` | Expected: a new model or pinned build produces a new key. |

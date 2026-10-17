@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local dry-run artifacts (production artifacts live on central-storage / agent-state)
+output/
+incoming_findings/
+central_memory/
+knowledge_base.db
+knowledge_base.db-wal
+knowledge_base.db-shm

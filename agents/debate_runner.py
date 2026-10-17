@@ -1,31 +1,34 @@
-"""Multi-round debate engine.
+"""Multi-round, tool-enabled debate engine.
 
-Each agent (GitHub Actions matrix leg) runs this script. It talks to a **single**
-locally hosted ``llama-server`` instance for the whole debate, and between rounds
-it synchronizes with peers through isolated Git branches (``agent-state/<agent>``)
-so that no two runners ever push to the same ref.
+Each agent (one GitHub Actions matrix leg) runs this script. It talks to a
+**single** locally hosted ``llama-server`` for the entire debate and, between
+rounds, synchronizes with peers through isolated Git branches
+(``agent-state/<agent>``) so no two runners ever push to the same ref.
 
 Round r protocol
 ----------------
-1. Build the prompt (task + sqlite-vec memory + own previous turn + peer turns).
-2. Generate one structured JSON turn from the local model.
-3. Commit ``output/round_r.json`` to ``agent-state/<agent_id>`` and force-push.
-4. Poll ``origin/agent-state/<peer>`` until every peer has published the same
-   ``run_id`` for round r (Git-based barrier), then continue to round r+1.
+1. System prompt = persona from ``agents/system_prompts.json`` (+ round directive).
+2. Tool loop: the model may call ``search_web`` / ``query_arxiv`` / ``fetch_url`` /
+   ``compute`` repeatedly (budget: ``max_tool_iterations``) before answering.
+3. Structured turn: schema-constrained JSON thesis for this round.
+4. Commit ``output/round_r.json`` to ``agent-state/<agent_id>`` and force-push.
+5. Poll ``origin/agent-state/<peer>`` until every peer published the same
+   ``run_id`` for round r (Git barrier), then continue to round r+1.
 
 Environment variables
 ---------------------
-AGENT_ID           Agent role, must be a key of agents/prompts.json (required)
-TASK_PROMPT        Debate topic (required)
-GITHUB_RUN_ID      Run identifier used to reject stale peer state (required)
-ALL_AGENTS         Comma separated roster (default: researcher,security_auditor,synthesizer)
-CONFIG_PATH        Path to model_config.json (default: external_config/model_config.json)
-PROMPTS_PATH       Path to prompts.json (default: agents/prompts.json)
-RAG_CONTEXT_PATH   Retrieved vector memory written by rag_query.py (default: /tmp/rag_context.json)
-LLAMA_BASE_URL     OpenAI-compatible endpoint of the local server (default: http://127.0.0.1:8080/v1)
-LLAMA_API_KEY      Dummy API key for llama-server (default: llama-cpp)
-ROUNDS_OVERRIDE    Optional integer overriding debate_rounds from the config
-GIT_REMOTE         Git remote name (default: origin)
+AGENT_ID             Agent role, must be a key of system_prompts.json (required)
+TASK_PROMPT          Debate topic (required)
+GITHUB_RUN_ID        Run identifier used to reject stale peer state (required)
+ALL_AGENTS           Comma separated roster (default: researcher,security_auditor,synthesizer)
+CONFIG_PATH          Path to model_config.json (default: external_config/model_config.json)
+SYSTEM_PROMPTS_PATH  Persona file (default: agents/system_prompts.json)
+RAG_CONTEXT_PATH     Retrieved vector memory from rag_query.py (default: /tmp/rag_context.json)
+LLAMA_BASE_URL       OpenAI-compatible endpoint of the local server (default: http://127.0.0.1:8080/v1)
+LLAMA_API_KEY        Dummy API key for llama-server (default: llama-cpp)
+ROUNDS_OVERRIDE      Optional integer overriding debate_rounds from the config
+GIT_REMOTE           Git remote name (default: origin)
+TOOL_ALLOWLIST       Set automatically per persona; restricts exposed tools
 """
 
 from __future__ import annotations
@@ -39,11 +42,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai import OpenAI
-from pydantic import BaseModel, ConfigDict
+# Make `import agent_tools` work whether this file is executed as a script
+# (`python agents/debate_runner.py`) or imported as a module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from agent_tools import run_tool_loop, tool_definitions  # noqa: E402
+
+from openai import OpenAI  # noqa: E402
+from pydantic import BaseModel, ConfigDict  # noqa: E402
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "external_config/model_config.json"))
-PROMPTS_PATH = Path(os.environ.get("PROMPTS_PATH", "agents/prompts.json"))
+SYSTEM_PROMPTS_PATH = Path(
+    os.environ.get("SYSTEM_PROMPTS_PATH", os.environ.get("PROMPTS_PATH", "agents/system_prompts.json"))
+)
 RAG_CONTEXT_PATH = Path(os.environ.get("RAG_CONTEXT_PATH", "/tmp/rag_context.json"))
 OUTPUT_DIR = Path("output")
 
@@ -209,30 +220,57 @@ def structured_turn(
 
 
 # --------------------------------------------------------------------------- #
-# Main debate loop
+# Prompt assembly
 # --------------------------------------------------------------------------- #
-def build_round_prompt(
-    round_num: int,
-    total_rounds: int,
-    own_previous: dict | None,
-    peer_findings: list[dict],
-) -> str:
+def build_round_instructions(round_num: int, total_rounds: int, tools_enabled: bool) -> str:
     if round_num == 1:
-        return (
+        instructions = (
             "This is Round 1 (Initial Thesis). Formulate your independent analysis based on "
             "the Task Objective and the Retrieved Vector Memory. "
             "Leave peer_critiques_and_rebuttals empty."
         )
+        if tools_enabled:
+            instructions += (
+                " Use your tools (`search_web` and/or `query_arxiv`) to ground your thesis in "
+                "current external evidence before answering."
+            )
+        return instructions
 
-    return (
+    instructions = (
         f"This is Debate Round {round_num} of {total_rounds}. Critically examine your peers' "
         f"Round {round_num - 1} findings, which are provided below.\n"
         "1. Point out specific flaws, blind spots, or contradictions in peer proposals.\n"
         "2. Defend or revise your own prior position where peers raised valid counterarguments.\n"
         "3. Converge toward a battle-tested technical consensus."
     )
+    if tools_enabled:
+        instructions += (
+            "\nUse your tools to verify any disputed technical claim (specs, limits, CVEs, "
+            "benchmarks) rather than asserting it from memory."
+        )
+    return instructions
 
 
+def build_system_prompt(persona: dict, round_instructions: str, tools_enabled: bool) -> str:
+    base = persona.get("system_prompt") or (
+        f"You are the {persona.get('role', 'Specialist')}. Specialty: {persona.get('focus', '')}"
+    )
+    available = [tool["function"]["name"] for tool in tool_definitions()] if tools_enabled else []
+    tool_line = (
+        f"\nAvailable tools: {', '.join(available)}. Call them whenever external evidence or "
+        "exact arithmetic would improve your answer."
+        if available
+        else ""
+    )
+    return (
+        f"{base}{tool_line}\n{round_instructions}\n"
+        "Respond strictly in JSON matching the requested schema. /no_think"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Main debate loop
+# --------------------------------------------------------------------------- #
 def main() -> int:
     agent_id = os.environ["AGENT_ID"]
     task_prompt = os.environ["TASK_PROMPT"]
@@ -245,16 +283,21 @@ def main() -> int:
 
     with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
         config = json.load(handle)
-    with open(PROMPTS_PATH, "r", encoding="utf-8") as handle:
+    with open(SYSTEM_PROMPTS_PATH, "r", encoding="utf-8") as handle:
         personas = json.load(handle)
 
     if agent_id not in personas:
-        raise KeyError(f"Agent '{agent_id}' is not defined in {PROMPTS_PATH}")
+        raise KeyError(f"Agent '{agent_id}' is not defined in {SYSTEM_PROMPTS_PATH}")
     persona = personas[agent_id]
 
-    total_rounds = int(
-        os.environ.get("ROUNDS_OVERRIDE") or config.get("debate_rounds", 2)
-    )
+    # Restrict the tool surface to this persona's allowlist (process-local).
+    persona_tools = persona.get("tools")
+    if isinstance(persona_tools, list) and persona_tools and not os.environ.get("TOOL_ALLOWLIST"):
+        os.environ["TOOL_ALLOWLIST"] = ",".join(persona_tools)
+
+    tools_enabled = bool(config.get("enable_tools", True)) and bool(tool_definitions())
+    max_tool_iterations = int(config.get("max_tool_iterations", 3))
+    total_rounds = int(os.environ.get("ROUNDS_OVERRIDE") or config.get("debate_rounds", 2))
     peer_timeout_sec = int(config.get("peer_timeout_sec", DEFAULT_PEER_TIMEOUT_SEC))
     model_alias = config.get("model_alias", "pareto-local")
     model_used = f"{config.get('hf_repo', 'unknown')}/{config.get('hf_file', 'unknown')}"
@@ -269,13 +312,19 @@ def main() -> int:
     OUTPUT_DIR.mkdir(exist_ok=True)
     prepare_agent_branch(agent_id)
 
+    print(
+        f"[{agent_id}] tools_enabled={tools_enabled} "
+        f"tool_budget={max_tool_iterations} rounds={total_rounds}"
+    )
+
     own_previous: dict | None = None
     peer_findings: list[dict] = []
+    tool_trace: list[dict] = []
 
     for round_num in range(1, total_rounds + 1):
         print(f"\n=== [{agent_id}] Debate Round {round_num}/{total_rounds} ===")
 
-        round_instructions = build_round_prompt(round_num, total_rounds, own_previous, peer_findings)
+        round_instructions = build_round_instructions(round_num, total_rounds, tools_enabled)
         debate_context = json.dumps(
             {
                 "your_previous_round": own_previous,
@@ -284,27 +333,33 @@ def main() -> int:
             indent=2,
         )
 
-        system_msg = (
-            f"You are the {persona['role']}. Specialty: {persona['focus']}\n"
-            f"{round_instructions}\n"
-            "Respond strictly in JSON matching the requested schema. /no_think"
-        )
-        user_msg = (
-            f"### Task Objective\n{task_prompt}\n\n"
-            f"### sqlite-vec Retrieved Historical Context\n{rag_context}\n\n"
-            f"### Multi-Agent Debate State\n{debate_context}"
-        )
+        messages = [
+            {"role": "system", "content": build_system_prompt(persona, round_instructions, tools_enabled)},
+            {
+                "role": "user",
+                "content": (
+                    f"### Task Objective\n{task_prompt}\n\n"
+                    f"### sqlite-vec Retrieved Historical Context\n{rag_context}\n\n"
+                    f"### Multi-Agent Debate State\n{debate_context}"
+                ),
+            },
+        ]
 
-        turn = structured_turn(
-            client,
-            model_alias,
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.25,
-        )
+        round_trace_start = len(tool_trace)
+        if tools_enabled:
+            messages = run_tool_loop(
+                client,
+                model_alias,
+                messages,
+                agent_id,
+                max_iterations=max_tool_iterations,
+                temperature=0.2,
+                trace=tool_trace,
+            )
 
+        turn = structured_turn(client, model_alias, messages, temperature=0.25)
+
+        round_trace = tool_trace[round_trace_start:]
         payload = {
             "agent_id": agent_id,
             "round_num": round_num,
@@ -317,11 +372,18 @@ def main() -> int:
             "peer_critiques_and_rebuttals": turn.peer_critiques_and_rebuttals,
             "remaining_risks": turn.remaining_risks,
             "confidence_score": float(turn.confidence_score),
+            "tools_used": sorted({entry["call"] for entry in round_trace}),
+            "tool_names": sorted({entry["tool"] for entry in round_trace}),
+            "tool_call_count": len(round_trace),
+            "tool_trace": round_trace,
         }
 
         round_file = OUTPUT_DIR / f"round_{round_num}.json"
         round_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         (OUTPUT_DIR / "latest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (OUTPUT_DIR / f"tool_trace_round_{round_num}.json").write_text(
+            json.dumps(round_trace, indent=2), encoding="utf-8"
+        )
 
         push_round_to_agent_branch(agent_id, round_num, run_id)
         own_previous = payload
@@ -331,7 +393,7 @@ def main() -> int:
                 agent_id, all_agents, round_num, run_id, peer_timeout_sec
             )
 
-    print(f"\n[{agent_id}] Completed {total_rounds} debate round(s).")
+    print(f"\n[{agent_id}] Completed {total_rounds} debate round(s) with {len(tool_trace)} tool call(s).")
     return 0
 
 

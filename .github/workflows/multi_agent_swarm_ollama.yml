@@ -109,7 +109,8 @@ jobs:
           AGENT_ID: ${{ matrix.agent_id }}
           TASK_PROMPT: ${{ inputs.task_prompt }}
           MODEL_NAME: ${{ inputs.pareto_model }}
-          PROMPTS_PATH: agents/prompts.json
+          SYSTEM_PROMPTS_PATH: agents/system_prompts.json
+          CENTRAL_MEMORY_PATH: central_memory/knowledge_base.json
         run: python agents/run_agent_ollama.py
 
       - name: Commit Agent Findings to Dedicated Agent Branch
@@ -154,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p incoming_findings
-          AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/prompts.json")).keys()))')
+          AGENTS=$(python3 -c 'import json; print(" ".join(json.load(open("agents/system_prompts.json")).keys()))')
           for agent in $AGENTS; do
             git fetch origin "agent-state/$agent"
             git show "origin/agent-state/$agent:output/${agent}_finding.json" \
