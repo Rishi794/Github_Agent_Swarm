@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,9 +28,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent_tools import run_tool_loop, tool_definitions  # noqa: E402
+from model_output import (  # noqa: E402
+    coerce_confidence,
+    coerce_str_list,
+    coerce_text,
+    parse_model_json,
+    salvage_from_exception,
+    task_identity,
+)
 
 from openai import OpenAI  # noqa: E402
-from pydantic import BaseModel, ConfigDict  # noqa: E402
+from pydantic import BaseModel, ConfigDict, field_validator  # noqa: E402
 
 SYSTEM_PROMPTS_PATH = Path(
     os.environ.get("SYSTEM_PROMPTS_PATH", os.environ.get("PROMPTS_PATH", "agents/system_prompts.json"))
@@ -40,7 +47,20 @@ OUTPUT_DIR = Path("output")
 CENTRAL_MEMORY = Path(os.environ.get("CENTRAL_MEMORY_PATH", "central_memory/knowledge_base.json"))
 MEMORY_TAIL = int(os.environ.get("CENTRAL_MEMORY_TAIL", "5"))
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+FINAL_FINDING_INSTRUCTION = (
+    "Produce your final answer now, as the closing turn of this conversation.\n"
+    "Output EXACTLY ONE JSON object — no markdown, no headings, no code fences, "
+    "no commentary before or after it.\n"
+    "The object must match this shape:\n"
+    "{\n"
+    '  "summary": "<2-4 sentence answer to the task objective>",\n'
+    '  "key_findings": ["<specific, evidence-backed finding>", "..."],\n'
+    '  "risks_or_open_questions": ["<risk or unresolved question>", "..."],\n'
+    '  "confidence_score": <number from 0 to 100>\n'
+    "}\n"
+    "Use [] for empty lists. Ground claims in the task context, tool results, or central "
+    "memory; never invent sources."
+)
 
 
 class AgentFinding(BaseModel):
@@ -50,6 +70,21 @@ class AgentFinding(BaseModel):
     key_findings: list[str] = []
     risks_or_open_questions: list[str] = []
     confidence_score: float = 0.0
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _summary_text(cls, value):  # noqa: ANN001 - pydantic before-validator
+        return coerce_text(value)
+
+    @field_validator("key_findings", "risks_or_open_questions", mode="before")
+    @classmethod
+    def _string_lists(cls, value):  # noqa: ANN001 - pydantic before-validator
+        return coerce_str_list(value)
+
+    @field_validator("confidence_score", mode="before")
+    @classmethod
+    def _confidence(cls, value):  # noqa: ANN001 - pydantic before-validator
+        return coerce_confidence(value)
 
 
 def load_central_memory(path: Path) -> str:
@@ -63,15 +98,16 @@ def load_central_memory(path: Path) -> str:
     return json.dumps(data.get("entries", [])[-MEMORY_TAIL:], indent=2)
 
 
-def extract_json(text: str) -> str:
-    fenced = _FENCE_RE.search(text)
-    if fenced:
-        return fenced.group(1).strip()
-    start, end = text.find("{"), text.rfind("}")
-    return text[start : end + 1] if start != -1 and end > start else text
-
-
 def structured_finding(client: OpenAI, model_name: str, messages: list[dict]) -> AgentFinding:
+    """Parse the model's closing turn, degrading at every step instead of raising.
+
+    1. Schema-constrained ``.parse`` (llama.cpp enforces it; Ollama may ignore it).
+    2. If that returns non-JSON, salvage the object embedded in the raised content.
+    3. Retry once in plain JSON-object mode with the schema restated in the prompt.
+    4. Last resort: keep the model's prose as the summary so the matrix leg still lands.
+    """
+    messages = [*messages, {"role": "user", "content": FINAL_FINDING_INSTRUCTION}]
+
     try:
         response = client.beta.chat.completions.parse(
             model=model_name,
@@ -83,15 +119,30 @@ def structured_finding(client: OpenAI, model_name: str, messages: list[dict]) ->
         if parsed is not None:
             return parsed
     except Exception as exc:  # noqa: BLE001 - fall back for servers without json_schema support
-        print(f"[agent] Structured parse unavailable ({type(exc).__name__}: {exc}); using JSON mode.")
+        salvaged = parse_model_json(salvage_from_exception(exc), AgentFinding)
+        if salvaged is not None:
+            print("[agent] Schema endpoint returned wrapped JSON; extracted the object it embedded.")
+            return salvaged
+        print(f"[agent] Schema-constrained parse unavailable ({type(exc).__name__}); using JSON mode.")
 
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-    )
-    return AgentFinding.model_validate_json(extract_json(response.choices[0].message.content or "{}"))
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content or ""
+    except Exception as exc:  # noqa: BLE001 - a bad request must not kill the matrix leg
+        print(f"[agent] JSON-mode request failed ({type(exc).__name__}: {exc}).")
+        content = ""
+
+    finding = parse_model_json(content, AgentFinding)
+    if finding is not None:
+        return finding
+
+    print("[agent] Model never produced a parseable JSON object; storing its prose as the summary.")
+    return AgentFinding(summary=coerce_text(content)[:2000], confidence_score=0.0)
 
 
 def main() -> int:
@@ -116,9 +167,16 @@ def main() -> int:
     available = [tool["function"]["name"] for tool in tool_definitions()] if tools_enabled else []
     system_instruction = (
         f"{base_prompt}\n"
-        + (f"Available tools: {', '.join(available)}.\n" if available else "")
-        + "Review the shared central memory and analyze the task. "
-        "Respond strictly with valid JSON matching the requested schema. /no_think"
+        + (
+            f"Available tools: {', '.join(available)}.\n"
+            "You have live tool access: call the tools BEFORE answering whenever the task "
+            "depends on current facts, external sources, versions, benchmarks, CVEs, or exact "
+            "arithmetic — do not rely on memory for those.\n"
+            if available
+            else ""
+        )
+        + "Review the shared central memory and analyze the task. Your final message must be a "
+        "single valid JSON object matching the schema given in the last user message. /no_think"
     )
     user_content = (
         f"### Task Objective\n{task_prompt}\n\n"
@@ -145,10 +203,10 @@ def main() -> int:
     finding = structured_finding(client, model_name, messages)
 
     payload = finding.model_dump()
+    payload.update(task_identity(task_prompt))
     payload["agent_id"] = agent_id
     payload["timestamp"] = datetime.now(timezone.utc).isoformat()
     payload["model_used"] = model_name
-    payload["task"] = task_prompt
     payload["tools_used"] = sorted({entry["call"] for entry in tool_trace})
     payload["tool_names"] = sorted({entry["tool"] for entry in tool_trace})
     payload["tool_call_count"] = len(tool_trace)

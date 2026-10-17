@@ -14,6 +14,7 @@ CONFIG_PATH       Path to ``model_config.json`` (default: external_config/model_
 KB_DB_PATH        Path to the sqlite-vec database (default: central_memory/knowledge_base.db)
 RAG_CONTEXT_PATH  Where the retrieved context JSON is written (default: /tmp/rag_context.json)
 TASK_PROMPT       The user task to embed (required)
+PAST_TASK_EXCERPT_CHARS  Max characters of a past task kept in the context (default: 400)
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ OUT_PATH = Path(os.environ.get("RAG_CONTEXT_PATH", "/tmp/rag_context.json"))
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_TOP_K = 4
+PAST_TASK_EXCERPT_CHARS = int(os.environ.get("PAST_TASK_EXCERPT_CHARS", "400"))
 
 
 def serialize_f32(vector: list[float]) -> bytes:
@@ -118,6 +120,11 @@ def main() -> int:
             key_findings = json.loads(key_findings_json)
         except (TypeError, json.JSONDecodeError):
             key_findings = []
+        # The mission prompt can be tens of kilobytes; only an excerpt belongs in
+        # the debate window (records keep ``task_chars``/``task_sha256`` for identity).
+        task = (task or "").strip()
+        if len(task) > PAST_TASK_EXCERPT_CHARS:
+            task = task[:PAST_TASK_EXCERPT_CHARS].rstrip() + " …"
         memories.append(
             {
                 "distance": round(float(dist), 4),

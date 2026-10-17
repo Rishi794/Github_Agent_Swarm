@@ -98,6 +98,19 @@ produces cross-critiqued, vector-indexed knowledge. It is **manual-only** on
 purpose — scheduling both would race two writers onto `central-storage` and
 double the compute bill for the same mission.
 
+The runner bakes its context window into a derived Ollama model at startup
+(`swarm-agent`, default `num_ctx 32768`, `q8_0` K/V cache, flash attention).
+Ollama's own default is **4096 tokens** and the OpenAI-compatible endpoint cannot
+set `num_ctx` per request, so a large `system_prompt.md` would otherwise be
+silently truncated before the model ever sees it. Each run logs the resolved
+prompt size against that window and warns when it gets tight.
+
+Findings are parsed defensively: the runner retries in JSON-object mode when a
+server ignores the schema, extracts JSON objects embedded in markdown reports
+without a second inference, and coerces the sloppy shapes 8B models emit
+(`"confidence_score": "87%"`, string-instead-of-list). A matrix leg only fails on
+infrastructure errors, never on formatting.
+
 ### `keepalive.yml` — repo/Actions liveness guard
 
 Weekly heartbeat commit + automatic re-enable of any workflow GitHub disabled for

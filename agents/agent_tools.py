@@ -593,11 +593,12 @@ def run_tool_loop(
 
     for iteration in range(max(1, int(max_iterations))):
         try:
+            # `tool_choice` is deliberately omitted: Ollama's OpenAI-compatible
+            # endpoint does not implement it, and llama-server defaults to "auto".
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=definitions,
-                tool_choice="auto",
                 temperature=temperature,
             )
         except Exception as exc:  # noqa: BLE001 - server may reject tools entirely

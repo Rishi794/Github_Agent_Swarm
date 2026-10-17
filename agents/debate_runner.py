@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -47,9 +46,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent_tools import run_tool_loop, tool_definitions  # noqa: E402
+from model_output import (  # noqa: E402
+    coerce_confidence,
+    coerce_str_list,
+    coerce_text,
+    parse_model_json,
+    salvage_from_exception,
+    task_identity,
+)
 
 from openai import OpenAI  # noqa: E402
-from pydantic import BaseModel, ConfigDict  # noqa: E402
+from pydantic import BaseModel, ConfigDict, field_validator  # noqa: E402
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "external_config/model_config.json"))
 SYSTEM_PROMPTS_PATH = Path(
@@ -63,6 +70,22 @@ DEFAULT_PEER_TIMEOUT_SEC = 1800
 POLL_INTERVAL_SEC = 6
 
 
+FINAL_TURN_INSTRUCTION = (
+    "Produce your answer for this round now, as the closing turn of the conversation.\n"
+    "Output EXACTLY ONE JSON object — no markdown, no headings, no code fences, "
+    "no commentary before or after it.\n"
+    "The object must match this shape:\n"
+    "{\n"
+    '  "summary": "<your position in 2-4 sentences>",\n'
+    '  "key_findings": ["<specific finding>", "..."],\n'
+    '  "peer_critiques_and_rebuttals": ["<critique or rebuttal; empty in round 1>", "..."],\n'
+    '  "remaining_risks": ["<risk or unresolved question>", "..."],\n'
+    '  "confidence_score": <number from 0 to 100>\n'
+    "}\n"
+    "Use [] for empty lists. Never invent sources, measurements, or tool results."
+)
+
+
 class DebateTurnOutput(BaseModel):
     """Schema the local model is constrained to produce each round."""
 
@@ -73,6 +96,21 @@ class DebateTurnOutput(BaseModel):
     peer_critiques_and_rebuttals: list[str] = []
     remaining_risks: list[str] = []
     confidence_score: float = 0.0
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _summary_text(cls, value):  # noqa: ANN001 - pydantic before-validator
+        return coerce_text(value)
+
+    @field_validator("key_findings", "peer_critiques_and_rebuttals", "remaining_risks", mode="before")
+    @classmethod
+    def _string_lists(cls, value):  # noqa: ANN001 - pydantic before-validator
+        return coerce_str_list(value)
+
+    @field_validator("confidence_score", mode="before")
+    @classmethod
+    def _confidence(cls, value):  # noqa: ANN001 - pydantic before-validator
+        return coerce_confidence(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,32 +208,21 @@ def wait_for_peer_rounds(
 # --------------------------------------------------------------------------- #
 # Structured generation
 # --------------------------------------------------------------------------- #
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def _extract_json(text: str) -> str:
-    """Best-effort extraction of a JSON object from free-form model output."""
-    fenced = _FENCE_RE.search(text)
-    if fenced:
-        return fenced.group(1).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        return text[start : end + 1]
-    return text
-
-
 def structured_turn(
     client: OpenAI,
     model_alias: str,
     messages: list[dict],
     temperature: float,
 ) -> DebateTurnOutput:
-    """Request a schema-constrained turn.
+    """Request a schema-constrained turn, degrading at every step instead of raising.
 
-    Prefers OpenAI-style ``response_format`` json_schema parsing, and transparently
-    falls back to plain JSON-object mode for llama.cpp builds that do not accept
-    the strict structured-output extension.
+    Prefers OpenAI-style ``response_format`` json_schema parsing, salvages the
+    object out of wrapped output when the server ignores it, then falls back to
+    plain JSON-object mode with the schema restated in the prompt. A round that
+    returns prose still produces a usable turn instead of killing the run.
     """
+    messages = [*messages, {"role": "user", "content": FINAL_TURN_INSTRUCTION}]
+
     try:
         response = client.beta.chat.completions.parse(
             model=model_alias,
@@ -207,16 +234,30 @@ def structured_turn(
         if parsed is not None:
             return parsed
     except Exception as exc:  # noqa: BLE001 - degrade gracefully on any server-side refusal
-        print(f"[debate] Structured parse unavailable ({type(exc).__name__}: {exc}); using JSON mode.")
+        salvaged = parse_model_json(salvage_from_exception(exc), DebateTurnOutput)
+        if salvaged is not None:
+            print("[debate] Schema endpoint returned wrapped JSON; extracted the object it embedded.")
+            return salvaged
+        print(f"[debate] Structured parse unavailable ({type(exc).__name__}); using JSON mode.")
 
-    response = client.chat.completions.create(
-        model=model_alias,
-        messages=messages,
-        temperature=temperature,
-        response_format={"type": "json_object"},
-    )
-    content = response.choices[0].message.content or "{}"
-    return DebateTurnOutput.model_validate_json(_extract_json(content))
+    try:
+        response = client.chat.completions.create(
+            model=model_alias,
+            messages=messages,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content or ""
+    except Exception as exc:  # noqa: BLE001 - a bad request must not kill the debate
+        print(f"[debate] JSON-mode request failed ({type(exc).__name__}: {exc}).")
+        content = ""
+
+    turn = parse_model_json(content, DebateTurnOutput)
+    if turn is not None:
+        return turn
+
+    print("[debate] Model never produced a parseable JSON object; carrying its prose forward.")
+    return DebateTurnOutput(summary=coerce_text(content)[:4000], confidence_score=0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -364,7 +405,7 @@ def main() -> int:
             "agent_id": agent_id,
             "round_num": round_num,
             "run_id": run_id,
-            "task": task_prompt,
+            **task_identity(task_prompt),
             "model_used": model_used,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "summary": turn.summary,
