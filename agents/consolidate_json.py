@@ -45,13 +45,23 @@ def render_report(knowledge_base: dict, new_findings: list[dict]) -> str:
         "## Latest Run Findings",
         "",
     ]
+    total_tool_calls = sum(int(item.get("tool_call_count", 0) or 0) for item in new_findings)
+    if total_tool_calls:
+        lines.extend([f"**Tool calls this run:** `{total_tool_calls}`", ""])
+
     for item in new_findings:
-        lines.append(f"### Agent: `{item['agent_id']}` (Model: `{item['model_used']}`)")
+        lines.append(f"### Agent: `{item.get('agent_id', 'unknown')}` (Model: `{item.get('model_used', 'unknown')}`)")
         lines.append("")
-        lines.append(f"**Task:** {item['task']}")
+        lines.append(f"**Task:** {item.get('task', '')}")
         lines.append("")
-        lines.append(f"**Summary:** {item['summary']}")
+        lines.append(f"**Summary:** {item.get('summary', '')}")
         lines.append("")
+
+        trace = item.get("tool_trace") or []
+        if trace:
+            lines.append(f"**Tools Dispatched ({len(trace)}):**")
+            lines.extend(f"- `{entry.get('call', entry.get('tool', 'unknown'))}`" for entry in trace)
+            lines.append("")
 
         findings = item.get("key_findings", []) or []
         if findings:
