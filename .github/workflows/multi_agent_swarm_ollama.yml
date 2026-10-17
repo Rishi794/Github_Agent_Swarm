@@ -292,22 +292,21 @@ jobs:
           git config user.name "central-storage-merger[bot]"
           git config user.email "merger@users.noreply.github.com"
 
+          # Single-commit orphan snapshot + force push: keeps the mutating store
+          # from accumulating in .git packfiles across runs. Files already on
+          # the branch (sqlite-vec KB, reports) are carried over so all writers
+          # coexist on one branch.
           git fetch origin central-storage 2>/dev/null || true
+          git checkout --orphan central-storage
+          git rm -rf --cached . > /dev/null
           if git show-ref --verify --quiet refs/remotes/origin/central-storage; then
-            git checkout -B central-storage origin/central-storage
-          else
-            git checkout --orphan central-storage
-            git rm -rf --cached . > /dev/null
+            git checkout origin/central-storage -- .
           fi
 
           cp central_memory/knowledge_base.json knowledge_base.json
           cp central_memory/SWARM_REPORT.md SWARM_REPORT.md
           git add -f knowledge_base.json SWARM_REPORT.md
 
-          if git diff --cached --quiet; then
-            echo "No knowledge-base changes to publish."
-          else
-            git commit -m "storage: consolidate multi-agent findings (run #${{ github.run_number }})"
-            git push origin central-storage
-            echo "Published knowledge_base.json + SWARM_REPORT.md to central-storage."
-          fi
+          git commit -m "storage: consolidate multi-agent findings (run #${{ github.run_number }})"
+          git push --force origin central-storage
+          echo "Published orphan snapshot (knowledge_base.json, SWARM_REPORT.md) to central-storage."

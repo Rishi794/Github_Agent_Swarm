@@ -50,7 +50,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 │      (SQLite + sqlite-vec vec0 table) → WAL checkpoint → VACUUM → commit       │
 │  render agentic_results.md (transcript + tool evidence) + README.md dashboard  │
 │                                                                               │
-│  push → central-storage  (orphan branch: knowledge_base.db + reports)          │
+│  push → central-storage  (1-commit orphan snapshot, force-pushed)              │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,7 +60,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 | --- | --- | --- |
 | `main` | you | Workflows and Python orchestration only. Never receives automated data commits. |
 | `agent-state/<agent_id>` (one per persona; 100 today) | that persona's runner only | `output/round_<r>.json`, `output/latest.json` |
-| `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard |
+| `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard — published as a **single-commit orphan snapshot** (force-pushed each run), so the mutating binary DB never accumulates in `.git` packfiles. Files published by other writers (Ollama store, search reports) are carried over. |
 
 One writer per ref means parallel runners can never produce `non-fast-forward`
 push collisions. Peers read each other with `git fetch` + `git show`, and every
@@ -86,7 +86,7 @@ https://raw.githubusercontent.com/Rishi794/Github_Agent_Swarm/central-storage/ag
 | Model | Downloads a prebuilt `llama-server` (Ubuntu x64 CPU build) plus the GGUF from the config repo, cached by `actions/cache`. |
 | Tools | `llama-server --jinja` gives the model native function calling. Each round, agents may call `search_web`, `query_arxiv`, `fetch_url`, and `compute` before answering; every call is traced. |
 | Debate | One `llama-server` per agent serves **all** rounds. Each round: tools → generate → push to `agent-state/<agent>` → wait for peers → next round. |
-| Fan-in | `agents/consolidate_sqlite.py` embeds every round, appends to `knowledge_base.db`, checkpoints WAL, VACUUMs, and writes `agentic_results.md` + `README.md` to `central-storage`. |
+| Fan-in | `agents/consolidate_sqlite.py` embeds every round, appends to `knowledge_base.db`, checkpoints WAL, VACUUMs, and writes `agentic_results.md` + `README.md` to `central-storage` as a single-commit orphan snapshot. |
 
 ### `multi_agent_swarm_ollama.yml` — single-pass swarm (lightweight alternative)
 
@@ -139,7 +139,9 @@ mission defined in [`system_prompt.md`](./system_prompt.md) at the repo root.
 - `rounds_override` — optional; overrides `debate_rounds` for a single run.
 
 Each run fills `agent-state/<agent>` round by round, then a single consolidator job
-publishes `knowledge_base.db`, `agentic_results.md` and `README.md` to `central-storage`.
+publishes `knowledge_base.db`, `agentic_results.md` and `README.md` to `central-storage`
+as a force-pushed single-commit orphan snapshot (writes from the other workflows on the
+same branch are preserved).
 
 ### Schedule behaviour (know this before you tune it)
 
@@ -268,6 +270,12 @@ Safety and cost controls:
 
 * Every result is truncated to `MAX_TOOL_RESULT_CHARS` (default 6 000) so a large page
   cannot blow up the KV cache.
+* Network tool results are memoized in a per-runner SQLite cache (`TOOL_CACHE_PATH`,
+  default `/tmp/tool_cache.db`) with case/whitespace-insensitive keys, so dozens of
+  agents sharing a runner hit disk instead of re-querying rate-limited endpoints.
+  Cache misses jitter by `TOOL_FETCH_JITTER_SEC` (default 0.8 s) to spread bursts.
+  Errors and empty answers are **never** cached — they are retried. Set
+  `TOOL_CACHE_DISABLED=1` to bypass the cache entirely.
 * Tool failures return an error JSON instead of raising — a broken network never kills a debate.
 * The per-round budget is `max_tool_iterations` (config); when it is exhausted the agents
   are told to answer with what they have.
@@ -326,6 +334,6 @@ ORDER BY v.distance ASC;
 | `llama-server did not become healthy` | Bad flag combination in `llama_server_flags` | Inspect the printed server log tail; verify the flag exists in your pinned build. |
 | Vector search returns nothing | No `knowledge_base.db` yet, or `embedding_dim` changed | Run the debate once to populate it; keep `embedding_dim` in sync with `embedding_model`. |
 | Agents never call tools | Chat template without tool support, or tools disabled | Keep `--jinja` on the server launch (already set) and `enable_tools: true`; check the persona's `tools` list. |
-| `search_web` returns no results | Datacenter IP rate limited by DuckDuckGo | Expected: the tool falls back to DuckDuckGo Instant Answer, then Wikipedia. Set `TOOL_ALLOWLIST=query_arxiv,compute` to work arxiv-only. |
+| `search_web` returns no results | Datacenter IP rate limited by DuckDuckGo | Expected: the tool falls back to DuckDuckGo Instant Answer, then Wikipedia, and repeated lookups are served from the runner-local tool cache. Set `TOOL_ALLOWLIST=query_arxiv,compute` to work arxiv-only. |
 | Tool output floods the context | Page larger than the context window | Lower `max_chars` in the model's call, or set `MAX_TOOL_RESULT_CHARS` lower (default 6 000). |
 | Cache restore is slow / misses | Cache key includes the GGUF filename and `llama_cpp_release` | Expected: a new model or pinned build produces a new key. |

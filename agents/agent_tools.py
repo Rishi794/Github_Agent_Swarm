@@ -25,18 +25,29 @@ MAX_TOOL_RESULT_CHARS    Hard cap on any single tool result (default: 6000).
 TOOL_HTTP_TIMEOUT        Per-request timeout in seconds (default: 15).
 ALLOW_PRIVATE_FETCH      Set to ``1`` to let ``fetch_url`` reach private/loopback
                          addresses (default: blocked, SSRF guard).
+TOOL_CACHE_PATH          SQLite file used to memoize network tool results, so
+                         dozens of agents sharing one runner do not re-hit
+                         rate-limited endpoints (default: /tmp/tool_cache.db).
+TOOL_CACHE_DISABLED      Set to ``1`` to bypass the tool cache entirely.
+TOOL_FETCH_JITTER_SEC    Upper bound of the random delay inserted before a real
+                         network fetch, spreading bursts across runners
+                         (default 0.8; set to 0 in tests).
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import html
 import ipaddress
 import json
 import math
 import os
+import random
 import re
 import socket
+import sqlite3
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +64,9 @@ HTTP_TIMEOUT = float(os.environ.get("TOOL_HTTP_TIMEOUT", "15"))
 MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", "6000"))
 MAX_SNIPPET_CHARS = 500
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
+TOOL_CACHE_PATH = os.environ.get("TOOL_CACHE_PATH", "/tmp/tool_cache.db")
+TOOL_FETCH_JITTER_SEC = float(os.environ.get("TOOL_FETCH_JITTER_SEC", "0.8"))
+_NETWORK_TOOLS = frozenset({"search_web", "query_arxiv", "fetch_url"})
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +178,72 @@ def _json(payload: dict) -> str:
     if len(text) > MAX_TOOL_RESULT_CHARS:
         text = text[: MAX_TOOL_RESULT_CHARS - 20] + '... [truncated]"}'
     return text
+
+
+# --------------------------------------------------------------------------- #
+# Result cache for network-backed tools
+# --------------------------------------------------------------------------- #
+def _normalize_value(value):  # noqa: ANN001 - recursive normalizer for cache keys
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip().lower()
+    if isinstance(value, dict):
+        return {key: _normalize_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_value(item) for item in value]
+    return value
+
+
+def _cache_key(tool: str, arguments: dict) -> str:
+    """Case/padding-insensitive key so lightly reworded repeats hit the cache."""
+    canonical = json.dumps(_normalize_value(arguments), sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(f"{tool}:{canonical}".encode("utf-8")).hexdigest()
+
+
+def _cache_enabled() -> bool:
+    return os.environ.get("TOOL_CACHE_DISABLED") != "1"
+
+
+def _lookup_cached(key: str) -> str | None:
+    try:
+        conn = sqlite3.connect(TOOL_CACHE_PATH, timeout=10.0)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS tool_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+            row = conn.execute("SELECT v FROM tool_cache WHERE k = ?", (key,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _store_cached(key: str, value: str) -> None:
+    try:
+        conn = sqlite3.connect(TOOL_CACHE_PATH, timeout=10.0)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS tool_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+            conn.execute("INSERT OR REPLACE INTO tool_cache (k, v) VALUES (?, ?)", (key, value))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _cacheable(result_json: str) -> bool:
+    """Only cache genuine payloads; empty/error answers should be retried later."""
+    try:
+        payload = json.loads(result_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or payload.get("error"):
+        return False
+    return bool(payload.get("results") or payload.get("papers") or payload.get("text"))
+
+
+def _jitter_delay() -> float:
+    if TOOL_FETCH_JITTER_SEC <= 0:
+        return 0.0
+    return random.uniform(min(0.15, TOOL_FETCH_JITTER_SEC), TOOL_FETCH_JITTER_SEC)
 
 
 # --------------------------------------------------------------------------- #
@@ -561,12 +641,27 @@ def dispatch_tool(name: str, arguments: dict) -> str:
     if not isinstance(arguments, dict):
         return _json({"error": "arguments must be an object"})
 
+    use_cache = name in _NETWORK_TOOLS and _cache_enabled()
+    key = _cache_key(name, arguments) if use_cache else ""
+    if use_cache:
+        cached = _lookup_cached(key)
+        if cached is not None:
+            print(f"[tools] cache hit: {describe_tool_call(name, arguments)}")
+            return cached
+        delay = _jitter_delay()
+        if delay > 0:
+            time.sleep(delay)
+
     try:
-        return TOOL_REGISTRY[name]["function"](**arguments)
+        result = TOOL_REGISTRY[name]["function"](**arguments)
     except TypeError as exc:  # bad/extra arguments produced by the model
         return _json({"error": f"invalid arguments for {name}: {exc}"})
     except Exception as exc:  # noqa: BLE001 - tool failures must never kill the debate
         return _json({"error": f"{type(exc).__name__}: {exc}"})
+
+    if use_cache and _cacheable(result):
+        _store_cached(key, result)
+    return result
 
 
 def run_tool_loop(

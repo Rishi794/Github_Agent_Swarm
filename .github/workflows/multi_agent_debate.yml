@@ -498,12 +498,17 @@ jobs:
           git config user.name "sqlite-vec-merger[bot]"
           git config user.email "merger@users.noreply.github.com"
 
+          # Publish as a single-commit orphan snapshot and force-push it. Each
+          # run replaces the branch with an unrelated commit, so the mutating
+          # binary knowledge_base.db never accumulates in .git packfiles
+          # (old snapshots become unreachable and are garbage-collected).
+          # Files already on the branch (Ollama store, search reports) are
+          # carried over so all writers coexist on one branch.
           git fetch origin central-storage 2>/dev/null || true
+          git checkout --orphan central-storage
+          git rm -rf --cached . > /dev/null
           if git show-ref --verify --quiet refs/remotes/origin/central-storage; then
-            git checkout -B central-storage origin/central-storage
-          else
-            git checkout --orphan central-storage
-            git rm -rf --cached . > /dev/null
+            git checkout origin/central-storage -- .
           fi
 
           cp central_memory/knowledge_base.db knowledge_base.db
@@ -511,10 +516,6 @@ jobs:
           cp central_memory/agentic_results.md agentic_results.md
           git add -f knowledge_base.db README.md agentic_results.md
 
-          if git diff --cached --quiet; then
-            echo "No knowledge-base changes to publish."
-          else
-            git commit -m "storage(sqlite-vec): index debate findings + agentic_results.md (run #${{ github.run_number }})"
-            git push origin central-storage
-            echo "Published knowledge_base.db, agentic_results.md and README.md to central-storage."
-          fi
+          git commit -m "storage(sqlite-vec): snapshot knowledge_base.db + agentic_results.md (run #${{ github.run_number }})"
+          git push --force origin central-storage
+          echo "Published orphan snapshot (knowledge_base.db, agentic_results.md, README.md) to central-storage."
