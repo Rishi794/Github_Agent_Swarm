@@ -60,7 +60,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 | --- | --- | --- |
 | `main` | you | Workflows and Python orchestration only. Never receives automated data commits. |
 | `agent-state/<agent_id>` (one per persona; 100 today) | that persona's runner only | `output/round_<r>.json`, `output/latest.json` |
-| `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard — published as a **single-commit orphan snapshot** (force-pushed each run), so the mutating binary DB never accumulates in `.git` packfiles. Files published by other writers (Ollama store, search reports) are carried over. |
+| `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard — published as a **single-commit orphan snapshot** (force-pushed each run), so the mutating binary DB never accumulates in `.git` packfiles. Files published by other writers (Ollama store, `search_results.md`) are carried over. |
 
 One writer per ref means parallel runners can never produce `non-fast-forward`
 push collisions. Peers read each other with `git fetch` + `git show`, and every
@@ -110,6 +110,23 @@ without a second inference, and coerces the sloppy shapes 8B models emit
 (`"confidence_score": "87%"`, string-instead-of-list). A matrix leg only fails on
 infrastructure errors, never on formatting.
 
+### `swarm_search.yml` — ask the knowledge base from GitHub (no local tools)
+
+Query everything the swarm has ever recorded, straight from the GitHub UI:
+
+- **Actions → Swarm Knowledge Search → Run workflow** — type a question, read the
+  synthesized answer on the run summary page.
+- **Open an issue titled `[Search] ...` or `[Ask] ...`** — the bot replies in the
+  thread (allow a few minutes; the runner boots the model to synthesize).
+
+Either way: fetch `knowledge_base.db` from `central-storage` → embed the question
+with the same model the RAG uses → sqlite-vec KNN over every indexed finding → the
+local llama-server writes an executive synthesis citing `[agent · round · run]` →
+publish to the run summary, the issue (when applicable), and
+`central-storage/search_results.md`. If the model cannot boot, the report still
+ships the ranked matches with a note. The job shares the `central-storage-writer`
+lock, so it can never race a swarm run's force-push.
+
 ### `keepalive.yml` — repo/Actions liveness guard
 
 Weekly heartbeat commit + automatic re-enable of any workflow GitHub disabled for
@@ -142,6 +159,15 @@ Each run fills `agent-state/<agent>` round by round, then a single consolidator 
 publishes `knowledge_base.db`, `agentic_results.md` and `README.md` to `central-storage`
 as a force-pushed single-commit orphan snapshot (writes from the other workflows on the
 same branch are preserved).
+
+### Asking the swarm a question
+
+Use **Actions → Swarm Knowledge Search → Run workflow**, or open an issue titled
+`[Search] <question>` (also `[Ask]`). The runner retrieves the closest findings from
+`knowledge_base.db` and writes an executive synthesis with `agent · round · run`
+citations — published to the run summary, the issue thread, and
+`central-storage/search_results.md`. `top_k` caps how many findings enter the
+synthesis prompt (1–25, default 8).
 
 ### Schedule behaviour (know this before you tune it)
 
@@ -195,12 +221,14 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 .
 ├── .github/workflows/
 │   ├── multi_agent_debate.yml         # fan-out debate + sqlite-vec fan-in  (primary)
-│   └── multi_agent_swarm_ollama.yml   # single-pass Ollama swarm            (alternative)
+│   ├── multi_agent_swarm_ollama.yml   # single-pass Ollama swarm            (alternative)
+│   └── swarm_search.yml               # ask the knowledge base (issue or manual)
 ├── agents/
 │   ├── system_prompts.json            # personas + per-persona tool allowlists
 │   ├── agent_tools.py                 # search_web, query_arxiv, fetch_url, compute
 │   ├── rag_query.py                   # pre-LLM sqlite-vec KNN retrieval
 │   ├── debate_runner.py               # tool loop + multi-round debate + Git barriers
+│   ├── knowledge_search.py            # issue/dispatch Q&A over the vector memory
 │   ├── consolidate_sqlite.py          # fan-in: vectors + agentic_results.md
 │   ├── run_agent_ollama.py            # single-pass inference (Ollama workflow)
 │   └── consolidate_json.py            # fan-in: append to knowledge_base.json
@@ -337,3 +365,5 @@ ORDER BY v.distance ASC;
 | `search_web` returns no results | Datacenter IP rate limited by DuckDuckGo | Expected: the tool falls back to DuckDuckGo Instant Answer, then Wikipedia, and repeated lookups are served from the runner-local tool cache. Set `TOOL_ALLOWLIST=query_arxiv,compute` to work arxiv-only. |
 | Tool output floods the context | Page larger than the context window | Lower `max_chars` in the model's call, or set `MAX_TOOL_RESULT_CHARS` lower (default 6 000). |
 | Cache restore is slow / misses | Cache key includes the GGUF filename and `llama_cpp_release` | Expected: a new model or pinned build produces a new key. |
+| Issue titled `[Search] ...` gets no reply | The search workflow listens for `issues: [opened]` with that title prefix only | Check the Actions tab for the run; renaming an issue after opening does not retrigger. Re-ask via **Actions → Swarm Knowledge Search → Run workflow**. |
+| Search reports "no knowledge base yet" | No consolidating debate run has published `central-storage/knowledge_base.db` | Trigger the debate workflow once; searches then answer from the findings it indexed. |

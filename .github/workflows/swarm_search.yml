@@ -1,0 +1,319 @@
+name: Swarm Knowledge Search (Issues & manual)
+
+# Ask the swarm's knowledge base — entirely from GitHub, no local tooling.
+#
+# Two triggers:
+#   * Actions -> "Swarm Knowledge Search" -> Run workflow   (type a question)
+#   * Open an issue titled "[Search] ..." or "[Ask] ..."     (bot answers in-thread)
+#
+# What happens: fetch knowledge_base.db from `central-storage` -> embed the
+# question (fastembed) -> sqlite-vec KNN over every indexed finding -> a local
+# llama-server synthesizes an executive answer citing agents/rounds/runs ->
+# the report is posted to the run summary, the issue thread (when applicable),
+# and republished as central-storage/search_results.md.
+#
+# Degrades gracefully: if the model cannot boot, the report still ships the
+# ranked vector matches with a note. If no knowledge base exists yet, the
+# report explains how to build one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: 'Question to ask the swarm knowledge base'
+        required: true
+        default: 'What are the highest-ranked open risks identified so far, and who disagrees?'
+      top_k:
+        description: 'How many vector matches to retrieve (1-25)'
+        required: false
+        default: '8'
+      config_repo:
+        description: 'External GitHub repository containing model_config.json (owner/repo)'
+        required: false
+        default: ''
+      config_ref:
+        description: 'Branch or tag in the external model config repository'
+        required: false
+        default: ''
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  DEFAULT_CONFIG_REPO: 'Rishi794/Model_Config'
+  DEFAULT_CONFIG_REF: 'main'
+
+jobs:
+  swarm-search:
+    # Manual dispatch, or an issue whose title starts with [Search] / [Ask].
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.issue.title, '[Search]') ||
+      startsWith(github.event.issue.title, '[Ask]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Shares the writer lock with the consolidator jobs: a search can never
+    # race a force-push onto `central-storage`, and vice versa.
+    concurrency:
+      group: central-storage-writer
+      cancel-in-progress: false
+    steps:
+      - name: Checkout Codebase Tools
+        uses: actions/checkout@v4
+
+      - name: Checkout External Model Config Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.config_repo || env.DEFAULT_CONFIG_REPO }}
+          ref: ${{ inputs.config_ref || env.DEFAULT_CONFIG_REF }}
+          path: external_config
+          token: ${{ secrets.CONFIG_REPO_TOKEN || github.token }}
+
+      - name: Fetch Knowledge Base from Central Storage
+        continue-on-error: true
+        run: |
+          mkdir -p central_memory
+          if git fetch origin central-storage 2>/dev/null; then
+            git show origin/central-storage:knowledge_base.db > central_memory/knowledge_base.db \
+              || rm -f central_memory/knowledge_base.db
+            ls -lh central_memory/ || true
+          else
+            echo "No central-storage branch yet -> the report will explain how to build one."
+          fi
+
+      - name: Resolve Query & Model Config
+        id: q
+        env:
+          DISPATCH_QUERY: ${{ inputs.search_query }}
+          DISPATCH_TOP_K: ${{ inputs.top_k }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          title = (os.environ.get("ISSUE_TITLE") or "").strip()
+          body = (os.environ.get("ISSUE_BODY") or "").strip()
+          query = (os.environ.get("DISPATCH_QUERY") or "").strip()
+
+          if not query:
+              for marker in ("[Search]", "[Ask]"):
+                  if title.lower().startswith(marker.lower()):
+                      title = title[len(marker):].strip()
+                      break
+              query = f"{title}\n\n{body}".strip()
+
+          query = query[:2000]
+          top_k = (os.environ.get("DISPATCH_TOP_K") or "8").strip() or "8"
+
+          with open("external_config/model_config.json", encoding="utf-8") as fh:
+              cfg = json.load(fh)
+          cache_key = f"{cfg['hf_repo']}-{cfg['hf_file']}".replace("/", "-")
+
+          print("query<<EOF")
+          print(query)
+          print("EOF")
+          print(f"top_k={top_k}")
+          print(f"hf_repo={cfg['hf_repo']}")
+          print(f"hf_file={cfg['hf_file']}")
+          print(f"model_alias={cfg['model_alias']}")
+          print(f"llama_cpp_release={cfg.get('llama_cpp_release', 'auto')}")
+          print(f"cache_key=llama-{cache_key}-{cfg.get('llama_cpp_release', 'auto')}")
+
+          flags = cfg["llama_server_flags"]
+          print(
+              "flags="
+              f"-t {flags['threads']} -tb {flags['threads_batch']} -c {flags['ctx_size']} "
+              f"-b {flags['batch_size']} -ub {flags['ubatch_size']} -np {flags['parallel_slots']} "
+              f"-ctk {flags['cache_type_k']} -ctv {flags['cache_type_v']} "
+              f"-lm {flags['load_mode']} -fa {flags['flash_attn']}"
+          )
+          PY
+
+      - name: Set up Python & Cache Dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python Packages
+        run: pip install -r requirements.txt
+
+      - name: Cache GGUF Weights, llama.cpp Binaries & Embedding Weights
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/gguf_models
+            ~/.cache/llama_bin
+            ~/.cache/fastembed
+          key: ${{ steps.q.outputs.cache_key }}-search
+
+      - name: Download Prebuilt llama-server & GGUF Weights
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_REPO: ${{ steps.q.outputs.hf_repo }}
+          HF_FILE: ${{ steps.q.outputs.hf_file }}
+          LLAMA_CPP_RELEASE: ${{ steps.q.outputs.llama_cpp_release }}
+        run: |
+          set -euo pipefail
+          BIN_DIR="$HOME/.cache/llama_bin"
+          MODEL_DIR="$HOME/.cache/gguf_models"
+          mkdir -p "$BIN_DIR" "$MODEL_DIR"
+
+          if [ ! -x "$BIN_DIR/llama-server" ]; then
+            echo "Resolving llama.cpp Linux x64 CPU build (requested: $LLAMA_CPP_RELEASE) ..."
+            ASSET_URL=$(python3 - <<'PY'
+          import json, os, urllib.request
+
+          TOKEN = os.environ.get("GH_TOKEN", "")
+          WANTED = os.environ.get("LLAMA_CPP_RELEASE", "auto").strip()
+          SUFFIX = "bin-ubuntu-x64.tar.gz"   # plain CPU build (no cuda/rocm/vulkan/sycl/openvino)
+
+
+          def api(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {TOKEN}",
+                      "User-Agent": "multi-agent-swarm-setup",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+
+          def asset_for(release):
+              for asset in release.get("assets", []):
+                  name = asset["name"]
+                  if name.endswith(SUFFIX) and "cudart" not in name:
+                      return asset["browser_download_url"]
+              return None
+
+
+          url = None
+          if WANTED and WANTED.lower() != "auto":
+              url = asset_for(api(f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{WANTED}"))
+              if url is None:
+                  raise SystemExit(f"No {SUFFIX} asset found for pinned release {WANTED}")
+          else:
+              releases = api("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=40")
+              for release in releases:
+                  url = asset_for(release)
+                  if url:
+                      print(f"# using {release['tag_name']}", file=os.sys.stderr)
+                      break
+              if url is None:
+                  raise SystemExit("No Linux x64 CPU llama.cpp build found in the last 40 releases")
+
+          print(url)
+          PY
+          )
+            curl -fL --retry 5 --retry-all-errors --retry-delay 5 "$ASSET_URL" -o /tmp/llama.tar.gz
+            tar -xzf /tmp/llama.tar.gz -C "$BIN_DIR" --strip-components=1
+            chmod +x "$BIN_DIR/llama-server"
+            rm -f /tmp/llama.tar.gz
+          fi
+          "$BIN_DIR/llama-server" --version | head -n 5
+
+          if [ ! -f "$MODEL_DIR/$HF_FILE" ]; then
+            echo "Downloading $HF_REPO/$HF_FILE ..."
+            if command -v hf >/dev/null 2>&1; then
+              hf download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR"
+            else
+              huggingface-cli download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR"
+            fi
+          fi
+          ls -lh "$MODEL_DIR"
+
+      - name: Synthesize & Render the Search Report
+        env:
+          SEARCH_QUERY: ${{ steps.q.outputs.query }}
+          TOP_K: ${{ steps.q.outputs.top_k }}
+          CONFIG_PATH: external_config/model_config.json
+          KB_DB_PATH: central_memory/knowledge_base.db
+          OUTPUT_MD: central_memory/search_results.md
+          HITS_JSON_PATH: /tmp/retrieved_hits.json
+          LLM_MODEL: ${{ steps.q.outputs.model_alias }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HF_FILE: ${{ steps.q.outputs.hf_file }}
+          LLAMA_FLAGS: ${{ steps.q.outputs.flags }}
+        run: |
+          # Deliberately no `set -e`: a failed model boot must still produce a report.
+          set -uo pipefail
+          BIN_DIR="$HOME/.cache/llama_bin"
+          MODEL_DIR="$HOME/.cache/gguf_models"
+          export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          # shellcheck disable=SC2086  # LLAMA_FLAGS must word-split into separate CLI args.
+          "$BIN_DIR/llama-server" \
+            -m "$MODEL_DIR/$HF_FILE" \
+            --alias "$LLM_MODEL" \
+            --host 127.0.0.1 --port 8080 \
+            $LLAMA_FLAGS \
+            > /tmp/llama-server.log 2>&1 &
+          SERVER_PID=$!
+
+          echo "Waiting for llama-server readiness..."
+          READY=0
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$READY" = "1" ]; then
+            export LLM_BASE_URL="http://127.0.0.1:8080/v1"
+            echo "llama-server is healthy -> synthesis enabled."
+          else
+            echo "::warning::llama-server did not become healthy; shipping ranked vector matches without synthesis."
+            tail -n 40 /tmp/llama-server.log || true
+          fi
+
+          python agents/knowledge_search.py
+          RC=$?
+          kill "$SERVER_PID" 2>/dev/null || true
+          exit "$RC"
+
+      - name: Publish Report to the Run Summary
+        run: |
+          cat central_memory/search_results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the Triggering Issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file central_memory/search_results.md
+
+      - name: Publish search_results.md to Central Storage
+        run: |
+          set -euo pipefail
+          git config user.name "swarm-search[bot]"
+          git config user.email "search@users.noreply.github.com"
+
+          # Same orphan-snapshot policy as the swarm workflows: force-push a
+          # single-commit branch state and carry over every file already
+          # published there (KB, dashboard, Ollama store) — just add/update ours.
+          git fetch origin central-storage 2>/dev/null || true
+          git checkout --orphan central-storage
+          git rm -rf --cached . > /dev/null
+          if git show-ref --verify --quiet refs/remotes/origin/central-storage; then
+            git checkout origin/central-storage -- .
+          fi
+
+          cp central_memory/search_results.md search_results.md
+          git add -f search_results.md
+
+          git commit -m "search: publish the latest search_results.md (run #${{ github.run_number }})"
+          git push --force origin central-storage
+          echo "Published search_results.md to central-storage."
