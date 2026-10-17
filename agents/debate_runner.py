@@ -12,8 +12,12 @@ Round r protocol
    ``compute`` repeatedly (budget: ``max_tool_iterations``) before answering.
 3. Structured turn: schema-constrained JSON thesis for this round.
 4. Commit ``output/round_r.json`` to ``agent-state/<agent_id>`` and force-push.
-5. Poll ``origin/agent-state/<peer>`` until every peer published the same
-   ``run_id`` for round r (Git barrier), then continue to round r+1.
+5. Poll ``origin/agent-state/<peer>`` until the barrier target is met — every
+   peer, or ``peer_sync_count`` peers when that config value is non-zero (0 =
+   all peers). Large rosters cannot wait for all peers: GitHub runs only
+   ~20 concurrent jobs per account, so agents execute in waves. With a partial
+   target, a timeout proceeds with the peers that did publish (failing loudly
+   only when no peer published at all).
 
 Environment variables
 ---------------------
@@ -38,6 +42,7 @@ import os
 import subprocess
 import sys
 import time
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -162,15 +167,29 @@ def wait_for_peer_rounds(
     round_num: int,
     run_id: str,
     timeout_sec: int,
+    sync_count: int = 0,
 ) -> list[dict]:
-    """Git-based barrier: block until every peer publishes `round_num` for `run_id`."""
+    """Git-based barrier: block until the peer-sync target publishes `round_num`.
+
+    ``sync_count`` 0 keeps the strict behavior (wait for every peer, fail on
+    timeout). A positive value syncs with the first ``sync_count`` peers that
+    published, which is what makes rosters larger than the account's concurrent
+    job limit workable. On timeout with partial data, the agent proceeds with
+    what it has; it only fails when no peer published at all (broken barrier).
+    """
     remote = os.environ.get("GIT_REMOTE", "origin")
     peers = [peer for peer in all_agents if peer != agent_id]
+    target = len(peers) if sync_count <= 0 else min(sync_count, len(peers))
+    if peers:
+        # Rotate the peer list per agent so large rosters sample different
+        # subsets instead of every agent syncing with the same few peers.
+        offset = zlib.crc32(agent_id.encode("utf-8")) % len(peers)
+        peers = peers[offset:] + peers[:offset]
     collected: dict[str, dict] = {}
     deadline = time.time() + timeout_sec
 
-    print(f"[{agent_id}] Barrier: waiting for {peers} to publish Round {round_num} ...")
-    while len(collected) < len(peers):
+    print(f"[{agent_id}] Barrier: syncing with up to {target} of {len(peers)} peers for Round {round_num} ...")
+    while len(collected) < target:
         for peer in peers:
             if peer in collected:
                 continue
@@ -191,14 +210,23 @@ def wait_for_peer_rounds(
 
             if str(payload.get("run_id")) == str(run_id) and payload.get("round_num") == round_num:
                 collected[peer] = payload
-                print(f"[{agent_id}] Synchronized Round {round_num} from peer: {peer}")
+                print(f"[{agent_id}] Synchronized Round {round_num} from peer: {peer} ({len(collected)}/{target})")
+                if len(collected) >= target:
+                    break
 
-        if len(collected) < len(peers):
+        if len(collected) < target:
             if time.time() > deadline:
-                missing = sorted(set(peers) - set(collected))
+                if collected:
+                    print(
+                        f"[{agent_id}] Peer sync incomplete after {timeout_sec}s ({len(collected)}/{target}); "
+                        "proceeding with the peers that published. Lower peer_sync_count for faster rounds "
+                        "or raise peer_timeout_sec."
+                    )
+                    break
+                sample = ", ".join(peers[:5]) + ("..." if len(peers) > 5 else "")
                 raise TimeoutError(
                     f"[{agent_id}] Timed out after {timeout_sec}s waiting for peers "
-                    f"on round {round_num}: {missing}"
+                    f"on round {round_num}: no peer published (first checked: {sample})"
                 )
             time.sleep(POLL_INTERVAL_SEC)
 
@@ -340,6 +368,7 @@ def main() -> int:
     max_tool_iterations = int(config.get("max_tool_iterations", 3))
     total_rounds = int(os.environ.get("ROUNDS_OVERRIDE") or config.get("debate_rounds", 2))
     peer_timeout_sec = int(config.get("peer_timeout_sec", DEFAULT_PEER_TIMEOUT_SEC))
+    peer_sync_count = int(config.get("peer_sync_count", 0) or 0)
     model_alias = config.get("model_alias", "pareto-local")
     model_used = f"{config.get('hf_repo', 'unknown')}/{config.get('hf_file', 'unknown')}"
 
@@ -355,7 +384,8 @@ def main() -> int:
 
     print(
         f"[{agent_id}] tools_enabled={tools_enabled} "
-        f"tool_budget={max_tool_iterations} rounds={total_rounds}"
+        f"tool_budget={max_tool_iterations} rounds={total_rounds} "
+        f"peer_sync_count={peer_sync_count or 'all'} roster={len(all_agents)}"
     )
 
     own_previous: dict | None = None
@@ -431,7 +461,7 @@ def main() -> int:
 
         if round_num < total_rounds:
             peer_findings = wait_for_peer_rounds(
-                agent_id, all_agents, round_num, run_id, peer_timeout_sec
+                agent_id, all_agents, round_num, run_id, peer_timeout_sec, peer_sync_count
             )
 
     print(f"\n[{agent_id}] Completed {total_rounds} debate round(s) with {len(tool_trace)} tool call(s).")
