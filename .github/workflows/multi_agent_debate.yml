@@ -68,14 +68,16 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
+          import json, sys
           with open("agents/system_prompts.json", encoding="utf-8") as fh:
               roster = list(json.load(fh))
           if not roster:
               raise SystemExit("system_prompts.json defines no agents")
           print("agents=" + json.dumps(roster))
           print("agents_csv=" + ",".join(roster))
-          print(f"Roster: {len(roster)} agents")
+          # Only name=value lines may reach GITHUB_OUTPUT; the runner now FAILS the
+          # step on malformed lines ("Invalid format 'Roster: N agents'").
+          print(f"Roster: {len(roster)} agents", file=sys.stderr)
           PY
 
   # =========================================================================
