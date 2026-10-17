@@ -216,8 +216,9 @@ from the same file).
 
 * GitHub builds up to **256 matrix jobs per run**; the shipped roster has **100**.
 * Jobs execute **20 at a time** on Free (40 Pro / 60 Team / 500 Enterprise), so a
-  100-leg run flows through ~5 waves. Queue time does not count against a leg's
-  `timeout-minutes`, and the `swarm-debate` concurrency group keeps runs serialized.
+  100-leg run flows through ~5 waves; legs above the limit wait as `Queued` until a
+  slot frees. Each leg's `timeout-minutes` caps its execution once it starts, and the
+  `swarm-debate` concurrency group keeps whole runs serialized.
 * The Git barrier is **bounded**: `peer_sync_count` in `model_config.json` (currently
   `8`) lets each agent sync with the first N peers that publish a round instead of all
   99. If the timeout hits with partial data, the agent logs
