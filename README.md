@@ -27,7 +27,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
                                         │ actions/checkout (path: external_config/)
                                         ▼
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ JOB 0  roster  (reads agents/system_prompts.json — 100 research agents)        │
+│ JOB 0  roster  (reads agents/system_prompts.json — 10 research agents)         │
 │ JOB 1  debate-agents  (matrix = roster keys; one isolated leg per agent)      │
 │                                                                               │
 │  rag_query.py  ──►  /tmp/rag_context.json   (embeddings, then process exits)   │
@@ -59,7 +59,7 @@ tune a flag by editing one JSON file — no code change, no redeploy.
 | Branch | Writer | Contents |
 | --- | --- | --- |
 | `main` | you | Workflows and Python orchestration only. Never receives automated data commits. |
-| `agent-state/<agent_id>` (one per research agent; 100 today) | that agent's runner only | `output/round_<r>.json`, `output/latest.json` |
+| `agent-state/<agent_id>` (one per research agent; 10 today) | that agent's runner only | `output/round_<r>.json`, `output/latest.json` |
 | `central-storage` | consolidator job only | `knowledge_base.db` (sqlite-vec), `agentic_results.md`, `README.md` dashboard — published as a **single-commit orphan snapshot** (force-pushed each run), so the mutating binary DB never accumulates in `.git` packfiles. Files published by other writers (Ollama store, `search_results.md`) are carried over. |
 
 One writer per ref means parallel runners can never produce `non-fast-forward`
@@ -138,7 +138,8 @@ inactivity. See ["Repo & Actions stay alive"](#repo--actions-stay-alive-automati
 
 The swarm runs **automatically every 6 hours** (`cron: '0 */6 * * *'`, UTC) using the
 mission defined in [`system_prompt.md`](./system_prompt.md) at the repo root. The
-cadence leaves the runner queue room to drain: a full 100-agent run takes ~2–3 h.
+cadence leaves the runner queue room to drain — the 10-agent roster finishes in a
+fraction of that window, and even a 100-agent roster drains within it.
 
 ### Changing the mission — no code changes
 
@@ -229,7 +230,7 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 │   ├── multi_agent_swarm_ollama.yml   # single-pass Ollama swarm            (alternative)
 │   └── swarm_search.yml               # ask the knowledge base (issue or manual)
 ├── agents/
-│   ├── system_prompts.json            # the 100 research agents (mandate + tools)
+│   ├── system_prompts.json            # the research-agent roster (mandate + tools)
 │   ├── agent_tools.py                 # search_web, query_arxiv, fetch_url, compute
 │   ├── rag_query.py                   # pre-LLM sqlite-vec KNN retrieval
 │   ├── debate_runner.py               # tool loop + multi-round debate + Git barriers
@@ -242,9 +243,9 @@ If a run still dies with exit code 137, shrink `ctx_size`, drop to a smaller qua
 
 ### Adding an agent
 
-The shipped roster is **100 uniform research agents** (`research_agent_01` …
-`research_agent_100`): every one carries the same evidence-first mandate and the full
-tool set, so the debate samples 100 independent readings of the mission. To specialize
+The shipped roster is **10 uniform research agents** (`research_agent_01` …
+`research_agent_10`): every one carries the same evidence-first mandate and the full
+tool set, so the debate samples 10 independent readings of the mission. To specialize
 an agent, edit its `system_prompt` in `agents/system_prompts.json`.
 
 Add a key to `agents/system_prompts.json` — nothing else. A `roster` job in both
@@ -271,16 +272,17 @@ Leftover `agent-state/<removed>` branches are simply ignored by fan-in; delete t
 with `git push origin --delete agent-state/<agent>` if you want a clean branch list.
 Re-adding a key later is safe: consolidation dedupes by `(run_id, agent_id, round)`.
 
-### Scaling to a large roster (why 100 agents survive here)
+### Scaling the roster (how larger rosters survive here)
 
-* GitHub builds up to **256 matrix jobs per run**; the shipped roster has **100**.
+* GitHub builds up to **256 matrix jobs per run**; the shipped roster has **10** —
+  add keys to `agents/system_prompts.json` to scale up.
 * Jobs execute **20 at a time** on Free (40 Pro / 60 Team / 500 Enterprise), so a
-  100-leg run flows through ~5 waves; legs above the limit wait as `Queued` until a
-  slot frees. Each leg's `timeout-minutes` caps its execution once it starts, and the
+  100-leg roster would flow through ~5 waves; the shipped 10-leg roster runs in a
+  single wave. Legs above the limit wait as `Queued` until a slot frees. Each leg's `timeout-minutes` caps its execution once it starts, and the
   `swarm-debate` concurrency group keeps whole runs serialized.
 * The Git barrier is **bounded**: `peer_sync_count` in `model_config.json` (currently
-  `8`) lets each agent sync with the first N peers that publish a round instead of all
-  99. If the timeout hits with partial data, the agent logs
+  `8`) lets each agent sync with the first N peers that publish a round instead of all of
+  them. If the timeout hits with partial data, the agent logs
   `Peer sync incomplete ... proceeding` and finishes; it fails only when **no** peer
   published at all. Set `peer_sync_count: 0` for the strict all-peers barrier (small
   rosters). Peer scanning starts at a per-agent offset so agents sample different peers.
